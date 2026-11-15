@@ -1,5 +1,11 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.provider.ContactsContract
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -29,7 +35,9 @@ import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddCard
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.CurrencyExchange
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
@@ -43,9 +51,11 @@ import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material.icons.filled.TrendingDown
 import androidx.compose.material.icons.filled.TrendingUp
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -65,6 +75,7 @@ import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -79,18 +90,23 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
+import com.example.data.ai.AiAutoFeatureType
 import com.example.data.local.CustomerWithBalance
 import com.example.data.local.ReminderStatus
 import com.example.data.local.TransactionType
 import com.example.data.local.TransactionWithCustomer
+import com.example.security.AppPermissionsManager
 import com.example.ui.SmartDebtViewModel
 import com.example.ui.components.AdvancedSearchFilterBar
 import com.example.ui.components.AmountOutlinedField
@@ -106,6 +122,7 @@ import com.example.ui.components.PaymentReceiptDialog
 import com.example.ui.components.StatusBadge
 import com.example.ui.components.matchesDateRange
 import com.example.ui.navigation.AppRoutes
+import com.example.ui.theme.LocalAppIconShape
 import com.example.ui.theme.LocalFinancialColors
 import com.example.util.FormatUtils
 
@@ -531,9 +548,9 @@ private fun QuickActionButton(
         ) {
             Box(
                 modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(color.copy(alpha = 0.14f)),
+                    .size(38.dp)
+                    .clip(LocalAppIconShape.current)
+                    .background(color.copy(alpha = 0.16f)),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(icon, contentDescription = label, tint = color, modifier = Modifier.size(20.dp))
@@ -581,6 +598,7 @@ fun CustomersScreen(
     var selectedSort by remember { mutableStateOf(CustomerSortOption.HIGHEST_BALANCE) }
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
+    val context = LocalContext.current
 
     val activeRemindersByCustomer = remember(reminders) {
         reminders.filter { it.status != ReminderStatus.COMPLETED }.groupBy { it.customerId }
@@ -765,6 +783,7 @@ fun CustomersScreen(
                             onAddDebt = { onNavigate(AppRoutes.addDebt(cust.id)) },
                             onRecordPayment = { onNavigate(AppRoutes.addPayment(cust.id)) },
                             onSendSmsAlert = { onNavigate(AppRoutes.smsCenter(cust.id)) },
+                            onShareBalance = { viewModel.shareCustomerBalance(context, cust) },
                         )
                     }
                 }
@@ -785,6 +804,7 @@ private fun CustomerListItemCard(
     onAddDebt: () -> Unit,
     onRecordPayment: () -> Unit,
     onSendSmsAlert: () -> Unit,
+    onShareBalance: () -> Unit,
 ) {
     Card(
         modifier = Modifier
@@ -813,7 +833,7 @@ private fun CustomerListItemCard(
                     Box(
                         modifier = Modifier
                             .size(46.dp)
-                            .clip(CircleShape)
+                            .clip(LocalAppIconShape.current)
                             .background(MaterialTheme.colorScheme.primaryContainer),
                         contentAlignment = Alignment.Center,
                     ) {
@@ -937,6 +957,19 @@ private fun CustomerListItemCard(
                         )
                     }
                 }
+
+                IconButton(
+                    onClick = onShareBalance,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("customer_share_balance_${customer.id}"),
+                ) {
+                    Icon(
+                        Icons.Default.Share,
+                        contentDescription = "مشاركة رصيد العميل ${customer.name}",
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         }
     }
@@ -956,6 +989,7 @@ fun AddEditCustomerScreen(
         customerId?.let { id -> customers.find { it.id == id } }
     }
     val isEdit = existing != null
+    val context = LocalContext.current
 
     var name by remember(existing) { mutableStateOf(existing?.name ?: "") }
     var phone by remember(existing) { mutableStateOf(existing?.phone ?: "") }
@@ -964,6 +998,38 @@ fun AddEditCustomerScreen(
     var openingBalance by remember { mutableStateOf("") }
     var notes by remember(existing) { mutableStateOf(existing?.notes ?: "") }
     var isArchived by remember(existing) { mutableStateOf(existing?.isArchived ?: false) }
+
+    val contactPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val uri = result.data?.data
+        if (result.resultCode == Activity.RESULT_OK && uri != null) {
+            val picked = AppPermissionsManager.readContactFromUri(context, uri)
+            if (picked != null) {
+                if (picked.name.isNotBlank()) name = picked.name
+                if (picked.phone.isNotBlank()) phone = FormatUtils.normalizePhone(picked.phone)
+                viewModel.emitFeedback("تم استيراد جهة الاتصال: ${picked.name}")
+            } else {
+                viewModel.emitFeedback("تعذر قراءة بيانات جهة الاتصال المحددة.", isError = true)
+            }
+        }
+    }
+
+    val contactsPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            runCatching {
+                contactPickerLauncher.launch(
+                    Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)
+                )
+            }.onFailure {
+                viewModel.emitFeedback("تطبيق جهات الاتصال غير متوفر على هذا الجهاز.", isError = true)
+            }
+        } else {
+            viewModel.emitFeedback("يلزم منح صلاحية جهات الاتصال لاستيراد الاسم والرقم تلقائياً.", isError = true)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -988,6 +1054,30 @@ fun AddEditCustomerScreen(
                     .align(Alignment.CenterHorizontally),
             ) {
                 FinancialCard {
+                    OutlinedButton(
+                        onClick = {
+                            if (AppPermissionsManager.isPermissionGranted(context, Manifest.permission.READ_CONTACTS)) {
+                                runCatching {
+                                    contactPickerLauncher.launch(
+                                        Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)
+                                    )
+                                }.onFailure {
+                                    viewModel.emitFeedback("تطبيق جهات الاتصال غير متوفر.", isError = true)
+                                }
+                            } else {
+                                contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS)
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("pick_contact_button"),
+                    ) {
+                        Icon(Icons.Default.Contacts, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("استيراد الاسم والهاتف من جهات الاتصال")
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
                     OutlinedTextField(
                         value = name,
                         onValueChange = { name = it },
@@ -1113,9 +1203,11 @@ fun CustomerDetailScreen(
     val customer by customerFlow.collectAsStateWithLifecycle(initialValue = null)
     val txs by statementFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val aiFeatureResult by viewModel.aiFeatureResult.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     var receiptTargetTx by remember { mutableStateOf<TransactionWithCustomer?>(null) }
 
     Scaffold(
@@ -1125,7 +1217,13 @@ fun CustomerDetailScreen(
                 subtitle = customer?.accountNumber,
                 onBack = onBack,
                 actions = {
-                    if (customer != null) {
+                    customer?.let { c ->
+                        IconButton(
+                            onClick = { viewModel.shareCustomerBalance(context, c) },
+                            modifier = Modifier.testTag("topbar_share_balance_button"),
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = "مشاركة رصيد العميل")
+                        }
                         IconButton(onClick = { onNavigate(AppRoutes.addEditCustomer(customerId)) }) {
                             Icon(Icons.Default.Edit, contentDescription = "تعديل العميل")
                         }
@@ -1237,6 +1335,34 @@ fun CustomerDetailScreen(
                         Text("إرسال SMS")
                     }
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilledTonalButton(
+                        onClick = { viewModel.shareCustomerBalance(context, c) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("detail_share_balance_button"),
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("مشاركة الرصيد")
+                    }
+                    FilledTonalButton(
+                        onClick = { viewModel.generateAiAutoFeature(AiAutoFeatureType.COLLECTION_MESSAGE, c) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("detail_ai_suggest_button"),
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("اقتراح AI تلقائي")
+                    }
+                }
             }
 
             item {
@@ -1342,6 +1468,59 @@ fun CustomerDetailScreen(
             onSavePdfUri = { uri -> viewModel.savePaymentReceiptToUri(uri, tx, customer) },
             onPrintPdf = { viewModel.printPaymentReceipt(context, tx, customer) },
             onDismiss = { receiptTargetTx = null },
+        )
+    }
+
+    aiFeatureResult?.let { aiRes ->
+        val currentCust = customer
+        AlertDialog(
+            onDismissRequest = { viewModel.clearAiFeatureResult() },
+            title = { Text(aiRes.title, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Text(
+                            text = aiRes.firebaseRequiredNotice,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(
+                            listOf(
+                                AiAutoFeatureType.COLLECTION_MESSAGE,
+                                AiAutoFeatureType.INSTALLMENT_PLAN,
+                                AiAutoFeatureType.AUTO_WORKFLOW_RULE,
+                            )
+                        ) { ft ->
+                            FilterChip(
+                                selected = aiRes.featureType == ft,
+                                onClick = { viewModel.generateAiAutoFeature(ft, currentCust) },
+                                label = { Text(ft.titleAr, style = MaterialTheme.typography.labelSmall) },
+                            )
+                        }
+                    }
+                    Text(aiRes.content, style = MaterialTheme.typography.bodyMedium)
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(aiRes.content))
+                        viewModel.emitFeedback("تم نسخ النص المقترح إلى الحافظة")
+                    }
+                ) {
+                    Text("نسخ النص")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.clearAiFeatureResult() }) {
+                    Text("إغلاق")
+                }
+            },
         )
     }
 }

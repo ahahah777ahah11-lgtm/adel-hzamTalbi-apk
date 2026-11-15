@@ -21,7 +21,9 @@ import com.example.data.local.TransferEntity
 import com.example.data.local.TransferStatus
 import com.example.data.preferences.AppSettings
 import com.example.data.preferences.SettingsDataStore
+import com.example.ui.theme.AppBackgroundStyle
 import com.example.ui.theme.AppColorPalette
+import com.example.ui.theme.AppIconShape
 import com.example.ui.theme.AppThemeMode
 import org.json.JSONArray
 import org.json.JSONObject
@@ -90,11 +92,15 @@ class BackupManager(
                 put("currencySymbol", settings.currencySymbol)
                 put("themeMode", settings.themeMode.name)
                 put("colorPalette", settings.colorPalette.name)
+                put("backgroundStyle", settings.backgroundStyle.name)
+                put("iconShape", settings.iconShape.name)
                 put("allowOverpayment", settings.allowOverpayment)
                 put("duplicateWindowMinutes", settings.duplicateWindowMinutes)
                 put("workManagerRemindersEnabled", settings.workManagerRemindersEnabled)
                 put("overdueDaysThreshold", settings.overdueDaysThreshold)
                 put("biometricLockEnabled", settings.biometricLockEnabled)
+                put("autoUpdateCheckEnabled", settings.autoUpdateCheckEnabled)
+                put("updateManifestUrl", settings.updateManifestUrl)
             })
             put("customers", JSONArray().apply {
                 customers.forEach { c ->
@@ -286,20 +292,25 @@ class BackupManager(
     fun inspectSqliteBackupUri(context: Context, uri: Uri): SqliteBackupValidationResult {
         val tempFile = File(context.cacheDir, "inspect_restore_${System.currentTimeMillis()}.db")
         return try {
-            context.contentResolver.openInputStream(uri)?.use { input ->
+            val copied = context.contentResolver.openInputStream(uri)?.use { input ->
                 tempFile.outputStream().use { out -> input.copyTo(out) }
-            } ?: return SqliteBackupValidationResult(
-                isValid = false,
-                integrityOk = false,
-                errorMessage = "تعذر فتح ملف قاعدة البيانات المحدد.",
-            )
+                true
+            } ?: false
+            if (!copied) {
+                runCatching { tempFile.delete() }
+                return SqliteBackupValidationResult(
+                    isValid = false,
+                    integrityOk = false,
+                    errorMessage = "تعذر فتح ملف قاعدة البيانات المحدد.",
+                )
+            }
             inspectSqliteBackupFileInternal(tempFile, deleteOnInvalid = true)
-        } catch (e: Exception) {
-            tempFile.delete()
+        } catch (t: Throwable) {
+            runCatching { tempFile.delete() }
             SqliteBackupValidationResult(
                 isValid = false,
                 integrityOk = false,
-                errorMessage = "فشل قراءة ملف SQLite: ${e.message}",
+                errorMessage = "فشل قراءة ملف SQLite: ${t.message ?: "ملف غير صالح"}",
             )
         }
     }
@@ -311,12 +322,12 @@ class BackupManager(
                 tempFile.outputStream().use { out -> input.copyTo(out) }
             }
             inspectSqliteBackupFileInternal(tempFile, deleteOnInvalid = true)
-        } catch (e: Exception) {
-            tempFile.delete()
+        } catch (t: Throwable) {
+            runCatching { tempFile.delete() }
             SqliteBackupValidationResult(
                 isValid = false,
                 integrityOk = false,
-                errorMessage = "تعذر فحص ملف SQLite: ${e.message}",
+                errorMessage = "تعذر فحص ملف SQLite: ${t.message ?: "ملف تالف"}",
             )
         }
     }
@@ -387,12 +398,12 @@ class BackupManager(
                     tempDbFilePath = if (integrityOk) tempFile.absolutePath else null,
                 )
             }
-        } catch (e: Exception) {
-            if (deleteOnInvalid) tempFile.delete()
+        } catch (t: Throwable) {
+            if (deleteOnInvalid) runCatching { tempFile.delete() }
             SqliteBackupValidationResult(
                 isValid = false,
                 integrityOk = false,
-                errorMessage = "تعذر فتح قاعدة بيانات SQLite: ${e.message}",
+                errorMessage = "تعذر فتح قاعدة بيانات SQLite: ${t.message ?: "قاعدة بيانات تالفة"}",
             )
         }
     }
@@ -815,11 +826,17 @@ class BackupManager(
                         ?: AppThemeMode.SYSTEM,
                     colorPalette = AppColorPalette.entries.find { it.name == s.optString("colorPalette") }
                         ?: AppColorPalette.OFFICIAL_NAVY_TEAL,
+                    backgroundStyle = AppBackgroundStyle.entries.find { it.name == s.optString("backgroundStyle") }
+                        ?: AppBackgroundStyle.THEME_DEFAULT,
+                    iconShape = AppIconShape.entries.find { it.name == s.optString("iconShape") }
+                        ?: AppIconShape.SQUIRCLE,
                     allowOverpayment = s.optBoolean("allowOverpayment", false),
                     duplicateWindowMinutes = s.optInt("duplicateWindowMinutes", 5),
                     workManagerRemindersEnabled = s.optBoolean("workManagerRemindersEnabled", false),
                     overdueDaysThreshold = s.optInt("overdueDaysThreshold", 14),
                     biometricLockEnabled = s.optBoolean("biometricLockEnabled", false),
+                    autoUpdateCheckEnabled = s.optBoolean("autoUpdateCheckEnabled", true),
+                    updateManifestUrl = s.optString("updateManifestUrl", ""),
                 )
             }
 

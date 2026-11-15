@@ -1,6 +1,8 @@
 package com.example.ui.screens
 
+import android.Manifest
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -22,10 +24,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddCard
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Payments
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Replay
@@ -63,6 +68,7 @@ import com.example.data.importexport.ExportFormat
 import com.example.data.local.CustomerWithBalance
 import com.example.data.local.TransactionType
 import com.example.data.local.TransactionWithCustomer
+import com.example.security.AppPermissionsManager
 import com.example.ui.SmartDebtViewModel
 import com.example.ui.components.AdvancedSearchFilterBar
 import com.example.ui.components.AmountOutlinedField
@@ -290,11 +296,72 @@ fun AddDebtScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     var selectedCustomer by remember { mutableStateOf<CustomerWithBalance?>(null) }
     var isOpeningBalance by remember { mutableStateOf(false) }
     var amountText by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
+    var attachedPhotoPath by remember { mutableStateOf<String?>(null) }
+    var attachedLocationTag by remember { mutableStateOf<String?>(null) }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicturePreview()
+    ) { bitmap ->
+        if (bitmap != null) {
+            AppPermissionsManager.saveCapturedReceiptPhoto(context, bitmap, "debt")
+                .onSuccess { file ->
+                    attachedPhotoPath = file.name
+                    viewModel.emitFeedback("تم التقاط وحفظ صورة الفاتورة: ${file.name}")
+                }
+                .onFailure { err ->
+                    viewModel.emitFeedback("تعذر حفظ صورة الكاميرا: ${err.message}", isError = true)
+                }
+        }
+    }
+
+    val cameraPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            runCatching { cameraLauncher.launch(null) }
+                .onFailure { viewModel.emitFeedback("تعذر فتح تطبيق الكاميرا.", isError = true) }
+        } else {
+            viewModel.emitFeedback("يلزم منح صلاحية الكاميرا لالتقاط صورة الفاتورة.", isError = true)
+        }
+    }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            AppPermissionsManager.copyPhotoFromPickerUri(context, uri, "debt_gallery")
+                .onSuccess { file ->
+                    attachedPhotoPath = file.name
+                    viewModel.emitFeedback("تم إرفاق الصورة بنجاح: ${file.name}")
+                }
+                .onFailure { err ->
+                    viewModel.emitFeedback("تعذر قراءة الصورة: ${err.message}", isError = true)
+                }
+        }
+    }
+
+    val locationPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { perms ->
+        val granted = perms.values.any { it }
+        if (granted) {
+            val loc = AppPermissionsManager.getBestLastKnownLocation(context)
+            if (loc != null) {
+                attachedLocationTag = loc.toFormattedTag()
+                viewModel.emitFeedback("تم إرفاق ${loc.toFormattedTag()}")
+            } else {
+                viewModel.emitFeedback("تم تفعيل صلاحية الموقع؛ لا تتوفر إشارة GPS حالية.", isError = false)
+            }
+        } else {
+            viewModel.emitFeedback("تم رفض صلاحية الموقع الجغرافي.", isError = true)
+        }
+    }
 
     LaunchedEffect(customers, preselectedCustomerId) {
         if (selectedCustomer == null && preselectedCustomerId != null) {
@@ -355,6 +422,78 @@ fun AddDebtScreen(
                         .testTag("debt_description_input"),
                 )
 
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("مرفقات اختيارية (كاميرا / ملف / موقع):", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item {
+                        OutlinedButton(
+                            onClick = {
+                                if (AppPermissionsManager.isPermissionGranted(context, Manifest.permission.CAMERA)) {
+                                    runCatching { cameraLauncher.launch(null) }
+                                        .onFailure { viewModel.emitFeedback("تعذر تشغيل الكاميرا.", isError = true) }
+                                } else {
+                                    cameraPermLauncher.launch(Manifest.permission.CAMERA)
+                                }
+                            },
+                            modifier = Modifier.testTag("debt_camera_button"),
+                        ) {
+                            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("تصوير فاتورة")
+                        }
+                    }
+                    item {
+                        OutlinedButton(
+                            onClick = {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            modifier = Modifier.testTag("debt_photo_picker_button"),
+                        ) {
+                            Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("صورة من المعرض")
+                        }
+                    }
+                    item {
+                        OutlinedButton(
+                            onClick = {
+                                if (AppPermissionsManager.hasLocationPermission(context)) {
+                                    val loc = AppPermissionsManager.getBestLastKnownLocation(context)
+                                    if (loc != null) {
+                                        attachedLocationTag = loc.toFormattedTag()
+                                        viewModel.emitFeedback("تم إرفاق ${loc.toFormattedTag()}")
+                                    } else {
+                                        viewModel.emitFeedback("لم يتم رصد موقع حديث على الجهاز بعد.")
+                                    }
+                                } else {
+                                    locationPermLauncher.launch(
+                                        arrayOf(
+                                            Manifest.permission.ACCESS_FINE_LOCATION,
+                                            Manifest.permission.ACCESS_COARSE_LOCATION,
+                                        )
+                                    )
+                                }
+                            },
+                            modifier = Modifier.testTag("debt_location_button"),
+                        ) {
+                            Icon(Icons.Default.LocationOn, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("إرفاق الموقع")
+                        }
+                    }
+                }
+                if (attachedPhotoPath != null || attachedLocationTag != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    val extras = listOfNotNull(
+                        attachedPhotoPath?.let { "مرفق: $it" },
+                        attachedLocationTag,
+                    ).joinToString(" | ")
+                    Text(extras, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+                }
+
                 val parsed = FormatUtils.parsePositiveAmount(amountText)
                 val cust = selectedCustomer
                 if (cust != null && parsed != null && parsed > 0) {
@@ -384,11 +523,17 @@ fun AddDebtScreen(
                             return@Button
                         }
                         val amount = FormatUtils.parsePositiveAmount(amountText) ?: 0.0
+                        val baseDesc = description.ifBlank { if (isOpeningBalance) "رصيد افتتاحي" else "دين جديد" }
+                        val extras = listOfNotNull(
+                            attachedPhotoPath?.let { "مرفق: $it" },
+                            attachedLocationTag,
+                        ).joinToString(" • ")
+                        val fullDesc = if (extras.isBlank()) baseDesc else "$baseDesc ($extras)"
                         viewModel.recordTransaction(
                             customerId = target.id,
                             type = if (isOpeningBalance) TransactionType.OPENING_BALANCE else TransactionType.DEBT,
                             amount = amount,
-                            description = description.ifBlank { if (isOpeningBalance) "رصيد افتتاحي" else "دين جديد" },
+                            description = fullDesc,
                             dateMillis = System.currentTimeMillis(),
                             onSuccess = onSaved,
                         )

@@ -14,18 +14,18 @@ import com.example.data.local.SmartDebtDatabase
 import com.example.data.local.TransactionEntity
 import com.example.data.local.TransactionType
 import com.example.util.FormatUtils
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import java.io.ByteArrayInputStream
 import java.io.File
-import java.io.InputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.zip.ZipInputStream
-import kotlin.math.pow
 
 enum class ImportFileFormat(val labelAr: String) {
     SQLITE_DB("قاعدة بيانات SQLite (.db / .sqlite3)"),
@@ -108,44 +108,65 @@ class ExternalDbInspector(
     private val database: SmartDebtDatabase,
     private val backupManager: BackupManager,
 ) {
-    suspend fun inspectUri(context: Context, uri: Uri): Result<ImportInspectionResult> {
-        return try {
-            val fileName = resolveFileName(context, uri)
-            val tempFile = File(context.cacheDir, "import_preview_${System.currentTimeMillis()}.tmp")
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                tempFile.outputStream().use { output -> input.copyTo(output) }
-            } ?: return Result.failure(IllegalStateException("تعذر فتح الملف المحدد."))
+    companion object {
+        private const val MAX_IN_MEMORY_FILE_BYTES = 32L * 1024L * 1024L
+    }
 
-            val bytes = tempFile.readBytes()
-            val format = detectFormat(fileName, bytes)
-            val result = when (format) {
-                ImportFileFormat.SQLITE_DB -> inspectSqliteFile(tempFile, fileName)
-                ImportFileFormat.CSV -> inspectCsvBytes(bytes, fileName)
-                ImportFileFormat.XLSX -> inspectXlsxBytes(bytes, fileName)
-                ImportFileFormat.XLS -> inspectXlsBytes(bytes, fileName)
-                ImportFileFormat.JSON -> inspectJsonBytes(bytes, fileName)
+    suspend fun inspectUri(context: Context, uri: Uri): Result<ImportInspectionResult> {
+        val tempFile = File(context.cacheDir, "import_preview_${System.currentTimeMillis()}.tmp")
+        return try {
+            val fileName = runCatching { resolveFileName(context, uri) }.getOrDefault("import_file")
+            val copied = context.contentResolver.openInputStream(uri)?.use { input ->
+                tempFile.outputStream().use { output -> input.copyTo(output) }
+                true
+            } ?: false
+            if (!copied || !tempFile.exists()) {
+                return Result.failure(IllegalStateException("تعذر فتح الملف المحدد أو انتهت صلاحية الوصول إليه."))
             }
-            tempFile.delete()
-            result
-        } catch (e: Exception) {
-            Result.failure(IllegalStateException("تعذر قراءة الملف: ${e.message}"))
+            inspectTempOrRawFile(tempFile, fileName)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Result.failure(IllegalStateException("تعذر قراءة الملف: ${t.message ?: "ملف غير صالح أو تالف"}"))
+        } finally {
+            runCatching { tempFile.delete() }
         }
     }
 
     suspend fun inspectRawFile(file: File): Result<ImportInspectionResult> {
         return try {
-            val bytes = file.readBytes()
-            val format = detectFormat(file.name, bytes)
-            when (format) {
-                ImportFileFormat.SQLITE_DB -> inspectSqliteFile(file, file.name)
-                ImportFileFormat.CSV -> inspectCsvBytes(bytes, file.name)
-                ImportFileFormat.XLSX -> inspectXlsxBytes(bytes, file.name)
-                ImportFileFormat.XLS -> inspectXlsBytes(bytes, file.name)
-                ImportFileFormat.JSON -> inspectJsonBytes(bytes, file.name)
-            }
-        } catch (e: Exception) {
-            Result.failure(e)
+            inspectTempOrRawFile(file, file.name)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Result.failure(IllegalStateException("تعذر قراءة الملف: ${t.message ?: "ملف غير صالح"}"))
         }
+    }
+
+    private suspend fun inspectTempOrRawFile(file: File, fileName: String): Result<ImportInspectionResult> {
+        if (!file.exists() || file.length() <= 0L) {
+            return Result.failure(IllegalStateException("الملف المحدد فارغ ولا يحتوي على أي بيانات."))
+        }
+        val header = readHeaderPrefix(file, 64)
+        val format = detectFormat(fileName, header)
+        if (format == ImportFileFormat.SQLITE_DB) {
+            return inspectSqliteFile(file, fileName)
+        }
+        if (file.length() > MAX_IN_MEMORY_FILE_BYTES) {
+            return Result.failure(IllegalStateException("حجم الملف يتجاوز الحد الآمن للمعالجة (32 ميجابايت)."))
+        }
+        val bytes = file.readBytes()
+        return when (format) {
+            ImportFileFormat.SQLITE_DB -> inspectSqliteFile(file, fileName)
+            ImportFileFormat.CSV -> inspectCsvBytes(bytes, fileName)
+            ImportFileFormat.XLSX -> inspectXlsxBytes(bytes, fileName)
+            ImportFileFormat.XLS -> inspectXlsBytes(bytes, fileName)
+            ImportFileFormat.JSON -> inspectJsonBytes(bytes, fileName)
+        }
+    }
+
+    private fun readHeaderPrefix(file: File, maxLen: Int): ByteArray {
+        val buf = ByteArray(maxLen)
+        val count = file.inputStream().use { it.read(buf) }
+        return if (count <= 0) ByteArray(0) else buf.copyOf(count)
     }
 
     suspend fun rebuildPreview(
@@ -457,67 +478,88 @@ class ExternalDbInspector(
     }
 
     private suspend fun inspectSqliteFile(file: File, fileName: String): Result<ImportInspectionResult> {
+        if (!file.exists() || file.length() < 100L) {
+            return Result.failure(IllegalStateException("حجم ملف SQLite صغير جداً أو تالف."))
+        }
+        val magicHeader = readHeaderPrefix(file, 16)
+        if (!String(magicHeader, Charsets.US_ASCII).startsWith("SQLite format 3")) {
+            return Result.failure(IllegalStateException("الملف المختار ($fileName) ليس بصيغة SQLite3 صالحة."))
+        }
+
         val safeTempCopy = prepareSafeReadOnlySqliteCopy(file)
-        val db = SQLiteDatabase.openDatabase(
-            safeTempCopy.absolutePath,
-            null,
-            SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
-        )
         val tables = mutableListOf<DiscoveredTable>()
         var detectedApp = "قاعدة بيانات SQLite"
         try {
-            db.use { sqlite ->
-            val tableNames = mutableListOf<String>()
-            sqlite.rawQuery(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'android_metadata' AND name != 'room_master_table'",
+            val db = SQLiteDatabase.openDatabase(
+                safeTempCopy.absolutePath,
                 null,
-            ).use { cursor ->
-                while (cursor.moveToNext()) {
-                    tableNames.add(cursor.getString(0))
-                }
-            }
-
-            detectedApp = detectAccountingAppFromTables(tableNames, fileName)
-
-            for (tbl in tableNames) {
-                val columns = mutableListOf<String>()
-                sqlite.rawQuery("PRAGMA table_info(\"$tbl\")", null).use { c ->
-                    val nameIdx = c.getColumnIndex("name")
-                    while (c.moveToNext()) {
-                        if (nameIdx >= 0) columns.add(c.getString(nameIdx))
+                SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
+            )
+            db.use { sqlite ->
+                val tableNames = mutableListOf<String>()
+                sqlite.rawQuery(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'android_metadata' AND name != 'room_master_table'",
+                    null,
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        cursor.getString(0)?.takeIf { it.isNotBlank() }?.let { tableNames.add(it) }
                     }
                 }
-                if (columns.isEmpty()) continue
 
-                val rows = mutableListOf<Map<String, String>>()
-                sqlite.rawQuery("SELECT * FROM \"$tbl\" LIMIT 5000", null).use { c ->
-                    while (c.moveToNext()) {
-                        val map = linkedMapOf<String, String>()
-                        for (i in 0 until c.columnCount) {
-                            val colName = c.getColumnName(i)
-                            val value = when (c.getType(i)) {
-                                android.database.Cursor.FIELD_TYPE_NULL -> ""
-                                android.database.Cursor.FIELD_TYPE_INTEGER -> c.getLong(i).toString()
-                                android.database.Cursor.FIELD_TYPE_FLOAT -> {
-                                    val d = c.getDouble(i)
-                                    if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
+                detectedApp = detectAccountingAppFromTables(tableNames, fileName)
+
+                for (tbl in tableNames) {
+                    val escapedTbl = tbl.replace("\"", "\"\"")
+                    runCatching {
+                        val columns = mutableListOf<String>()
+                        sqlite.rawQuery("PRAGMA table_info(\"$escapedTbl\")", null).use { c ->
+                            val nameIdx = c.getColumnIndex("name")
+                            while (c.moveToNext()) {
+                                if (nameIdx >= 0) {
+                                    c.getString(nameIdx)?.let { columns.add(it) }
                                 }
-                                else -> c.getString(i).orEmpty()
                             }
-                            map[colName] = value
                         }
-                        rows.add(map)
+                        if (columns.isEmpty()) return@runCatching
+
+                        val rows = mutableListOf<Map<String, String>>()
+                        sqlite.rawQuery("SELECT * FROM \"$escapedTbl\" LIMIT 5000", null).use { c ->
+                            while (c.moveToNext()) {
+                                val map = linkedMapOf<String, String>()
+                                for (i in 0 until c.columnCount) {
+                                    val colName = c.getColumnName(i) ?: "col_$i"
+                                    val value = runCatching {
+                                        when (c.getType(i)) {
+                                            android.database.Cursor.FIELD_TYPE_NULL -> ""
+                                            android.database.Cursor.FIELD_TYPE_INTEGER -> c.getLong(i).toString()
+                                            android.database.Cursor.FIELD_TYPE_FLOAT -> {
+                                                val d = c.getDouble(i)
+                                                if (!d.isFinite()) "" else if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
+                                            }
+                                            android.database.Cursor.FIELD_TYPE_BLOB -> "[بيانات ثنائية]"
+                                            else -> c.getString(i).orEmpty()
+                                        }
+                                    }.getOrDefault("")
+                                    map[colName] = value
+                                }
+                                rows.add(map)
+                            }
+                        }
+                        tables.add(DiscoveredTable(name = tbl, columns = columns, rows = rows))
                     }
                 }
-                tables.add(DiscoveredTable(name = tbl, columns = columns, rows = rows))
             }
-            }
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            return Result.failure(IllegalStateException("فشل فتح قاعدة البيانات ($fileName): ${t.message ?: "قاعدة تالفة أو مشفرة"}"))
         } finally {
-            if (safeTempCopy != file) safeTempCopy.delete()
+            if (safeTempCopy != file) {
+                runCatching { safeTempCopy.delete() }
+            }
         }
 
         if (tables.isEmpty()) {
-            return Result.failure(IllegalStateException("لم يتم العثور على جداول بيانات داخل ملف SQLite."))
+            return Result.failure(IllegalStateException("لم يتم العثور على جداول بيانات قابلة للقراءة داخل ملف SQLite."))
         }
 
         val bestTable = pickBestCustomerTable(tables)
@@ -535,18 +577,31 @@ class ExternalDbInspector(
     }
 
     private fun prepareSafeReadOnlySqliteCopy(original: File): File {
-        val header = ByteArray(20)
-        original.inputStream().use { it.read(header) }
+        val header = readHeaderPrefix(original, 20)
+        if (header.size < 20) return original
         val isWal = header[18].toInt() == 2 || header[19].toInt() == 2
         if (!isWal) return original
-        // Copy to a temporary file and switch journal header bytes on the temp copy only (never modifying original)
-        val temp = File(original.parentFile ?: File("/tmp"), "safe_ro_${System.currentTimeMillis()}.db")
-        val bytes = original.readBytes()
-        if (bytes.size >= 20) {
-            if (bytes[18].toInt() == 2) bytes[18] = 1
-            if (bytes[19].toInt() == 2) bytes[19] = 1
+        // Stream-copy to a temporary file and switch journal header bytes on the temp copy only (never modifying original)
+        val tempDir = original.parentFile?.takeIf { it.canWrite() }
+            ?: File(System.getProperty("java.io.tmpdir") ?: ".")
+        val temp = File.createTempFile("safe_ro_", ".db", tempDir)
+        original.inputStream().use { input ->
+            temp.outputStream().use { output -> input.copyTo(output) }
         }
-        temp.writeBytes(bytes)
+        runCatching {
+            if (temp.length() >= 20L) {
+                RandomAccessFile(temp, "rw").use { raf ->
+                    raf.seek(18)
+                    val w = raf.read()
+                    val r = raf.read()
+                    if (w == 2 || r == 2) {
+                        raf.seek(18)
+                        raf.write(if (w == 2) 1 else w)
+                        raf.write(if (r == 2) 1 else r)
+                    }
+                }
+            }
+        }
         return temp
     }
 
@@ -667,132 +722,154 @@ class ExternalDbInspector(
     }
 
     private suspend fun inspectXlsxBytes(bytes: ByteArray, fileName: String): Result<ImportInspectionResult> {
-        val entries = mutableMapOf<String, ByteArray>()
-        ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
-            var entry = zip.nextEntry
-            while (entry != null) {
-                if (!entry.isDirectory) {
-                    entries[entry.name] = zip.readBytes()
-                }
-                entry = zip.nextEntry
-            }
-        }
-        val sharedStrings = entries["xl/sharedStrings.xml"]?.let { parseSharedStringsXml(it) } ?: emptyList()
-        val sheetPaths = entries.keys.filter { it.startsWith("xl/worksheets/sheet") && it.endsWith(".xml") }.sorted()
-        if (sheetPaths.isEmpty()) {
-            return Result.failure(IllegalStateException("ملف XLSX لا يحتوي على أوراق عمل صالحة."))
-        }
-
-        val tables = mutableListOf<DiscoveredTable>()
-        sheetPaths.forEachIndexed { sheetIdx, path ->
-            val sheetBytes = entries[path] ?: return@forEachIndexed
-            val matrix = parseSheetXml(sheetBytes, sharedStrings)
-            if (matrix.size >= 2) {
-                val headers = matrix.first().mapIndexed { idx, h -> h.trim().ifBlank { "عمود_${idx + 1}" } }
-                val rows = matrix.drop(1).filter { row -> row.any { it.isNotBlank() } }.map { row ->
-                    val map = linkedMapOf<String, String>()
-                    headers.forEachIndexed { idx, h ->
-                        map[h] = row.getOrElse(idx) { "" }.trim()
+        return try {
+            val entries = mutableMapOf<String, ByteArray>()
+            ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
+                var entry = zip.nextEntry
+                var totalUncompressed = 0L
+                while (entry != null && totalUncompressed < MAX_IN_MEMORY_FILE_BYTES) {
+                    if (!entry.isDirectory && (entry.name.startsWith("xl/sharedStrings") || entry.name.startsWith("xl/worksheets/"))) {
+                        val entryBytes = zip.readBytes()
+                        totalUncompressed += entryBytes.size
+                        if (totalUncompressed <= MAX_IN_MEMORY_FILE_BYTES) {
+                            entries[entry.name] = entryBytes
+                        }
                     }
-                    map
+                    entry = zip.nextEntry
                 }
-                tables.add(DiscoveredTable("ورقة_${sheetIdx + 1}", headers, rows))
             }
-        }
+            val sharedStrings = entries["xl/sharedStrings.xml"]?.let { runCatching { parseSharedStringsXml(it) }.getOrNull() } ?: emptyList()
+            val sheetPaths = entries.keys.filter { it.startsWith("xl/worksheets/sheet") && it.endsWith(".xml") }.sorted()
+            if (sheetPaths.isEmpty()) {
+                return Result.failure(IllegalStateException("ملف XLSX تالف أو لا يحتوي على أوراق عمل صالحة."))
+            }
 
-        if (tables.isEmpty()) {
-            return Result.failure(IllegalStateException("لا توجد صفوف بيانات صالحة داخل ملف XLSX."))
+            val tables = mutableListOf<DiscoveredTable>()
+            sheetPaths.forEachIndexed { sheetIdx, path ->
+                val sheetBytes = entries[path] ?: return@forEachIndexed
+                val matrix = runCatching { parseSheetXml(sheetBytes, sharedStrings) }.getOrDefault(emptyList())
+                if (matrix.size >= 2) {
+                    val headers = matrix.first().mapIndexed { idx, h -> h.trim().ifBlank { "عمود_${idx + 1}" } }
+                    val rows = matrix.drop(1).filter { row -> row.any { it.isNotBlank() } }.map { row ->
+                        val map = linkedMapOf<String, String>()
+                        headers.forEachIndexed { idx, h ->
+                            map[h] = row.getOrElse(idx) { "" }.trim()
+                        }
+                        map
+                    }
+                    tables.add(DiscoveredTable("ورقة_${sheetIdx + 1}", headers, rows))
+                }
+            }
+
+            if (tables.isEmpty()) {
+                return Result.failure(IllegalStateException("لا توجد صفوف بيانات صالحة داخل ملف XLSX."))
+            }
+            val best = pickBestCustomerTable(tables)
+            val mapping = suggestColumnMapping(best.columns)
+            val base = ImportInspectionResult(
+                fileName = fileName,
+                format = ImportFileFormat.XLSX,
+                detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
+                tables = tables,
+                selectedTableName = best.name,
+                mapping = mapping,
+                previewRows = emptyList(),
+            )
+            Result.success(rebuildPreview(base, best.name, mapping))
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Result.failure(IllegalStateException("ملف XLSX غير صالح أو تالف: ${t.message ?: "خطأ في قراءة الأرشيف"}"))
         }
-        val best = pickBestCustomerTable(tables)
-        val mapping = suggestColumnMapping(best.columns)
-        val base = ImportInspectionResult(
-            fileName = fileName,
-            format = ImportFileFormat.XLSX,
-            detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
-            tables = tables,
-            selectedTableName = best.name,
-            mapping = mapping,
-            previewRows = emptyList(),
-        )
-        return Result.success(rebuildPreview(base, best.name, mapping))
     }
 
     private suspend fun inspectXlsBytes(bytes: ByteArray, fileName: String): Result<ImportInspectionResult> {
-        // Check if .xls is actually SpreadsheetML XML / HTML export (common in Arabic accounting apps)
-        val headText = bytes.take(512).toByteArray().toString(Charsets.UTF_8).trimStart()
-        if (headText.startsWith("<") && (headText.contains("Workbook", true) || headText.contains("html", true) || headText.contains("table", true))) {
-            val tables = parseHtmlOrSpreadsheetMlXls(bytes.toString(Charsets.UTF_8))
-            if (tables.isNotEmpty()) {
-                val best = pickBestCustomerTable(tables)
-                val mapping = suggestColumnMapping(best.columns)
-                val base = ImportInspectionResult(
-                    fileName = fileName,
-                    format = ImportFileFormat.XLS,
-                    detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
-                    tables = tables,
-                    selectedTableName = best.name,
-                    mapping = mapping,
-                    previewRows = emptyList(),
-                )
-                return Result.success(rebuildPreview(base, best.name, mapping))
+        return try {
+            // Check if .xls is actually SpreadsheetML XML / HTML export (common in Arabic accounting apps)
+            val headText = bytes.take(512).toByteArray().toString(Charsets.UTF_8).trimStart()
+            if (headText.startsWith("<") && (headText.contains("Workbook", true) || headText.contains("html", true) || headText.contains("table", true))) {
+                val tables = parseHtmlOrSpreadsheetMlXls(bytes.toString(Charsets.UTF_8))
+                if (tables.isNotEmpty()) {
+                    val best = pickBestCustomerTable(tables)
+                    val mapping = suggestColumnMapping(best.columns)
+                    val base = ImportInspectionResult(
+                        fileName = fileName,
+                        format = ImportFileFormat.XLS,
+                        detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
+                        tables = tables,
+                        selectedTableName = best.name,
+                        mapping = mapping,
+                        previewRows = emptyList(),
+                    )
+                    return Result.success(rebuildPreview(base, best.name, mapping))
+                }
             }
-        }
 
-        // Binary BIFF8 OLE2 Compound Document (.xls)
-        val tables = parseBiff8Xls(bytes)
-        if (tables.isEmpty()) {
-            return Result.failure(IllegalStateException("تعذر استخراج جداول من ملف XLS. يرجى التأكد من سلامة الملف أو حفظه بصيغة XLSX/CSV."))
+            // Binary BIFF8 OLE2 Compound Document (.xls)
+            val tables = parseBiff8Xls(bytes)
+            if (tables.isEmpty()) {
+                return Result.failure(IllegalStateException("تعذر استخراج جداول من ملف XLS. يرجى التأكد من سلامة الملف أو حفظه بصيغة XLSX/CSV."))
+            }
+            val best = pickBestCustomerTable(tables)
+            val mapping = suggestColumnMapping(best.columns)
+            val base = ImportInspectionResult(
+                fileName = fileName,
+                format = ImportFileFormat.XLS,
+                detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
+                tables = tables,
+                selectedTableName = best.name,
+                mapping = mapping,
+                previewRows = emptyList(),
+            )
+            Result.success(rebuildPreview(base, best.name, mapping))
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Result.failure(IllegalStateException("فشل قراءة ملف XLS: ${t.message ?: "تنسيق غير مدعوم"}"))
         }
-        val best = pickBestCustomerTable(tables)
-        val mapping = suggestColumnMapping(best.columns)
-        val base = ImportInspectionResult(
-            fileName = fileName,
-            format = ImportFileFormat.XLS,
-            detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
-            tables = tables,
-            selectedTableName = best.name,
-            mapping = mapping,
-            previewRows = emptyList(),
-        )
-        return Result.success(rebuildPreview(base, best.name, mapping))
     }
 
     private suspend fun inspectJsonBytes(bytes: ByteArray, fileName: String): Result<ImportInspectionResult> {
-        val text = decodeBestCharset(bytes).removePrefix("\uFEFF").trim()
-        val tables = mutableListOf<DiscoveredTable>()
-        when {
-            text.startsWith("[") -> {
-                val arr = JSONArray(text)
-                tables.add(jsonArrayToTable("بيانات JSON", arr))
-            }
-            text.startsWith("{") -> {
-                val obj = JSONObject(text)
-                val dataNode = obj.optJSONObject("data") ?: obj
-                val keys = dataNode.keys()
-                while (keys.hasNext()) {
-                    val key = keys.next()
-                    val arr = dataNode.optJSONArray(key)
-                    if (arr != null && arr.length() > 0 && arr.optJSONObject(0) != null) {
-                        tables.add(jsonArrayToTable(key, arr))
+        return try {
+            val text = decodeBestCharset(bytes).removePrefix("\uFEFF").trim()
+            val tables = mutableListOf<DiscoveredTable>()
+            when {
+                text.startsWith("[") -> {
+                    val arr = JSONArray(text)
+                    val tbl = jsonArrayToTable("بيانات JSON", arr)
+                    if (tbl.rows.isNotEmpty()) tables.add(tbl)
+                }
+                text.startsWith("{") -> {
+                    val obj = JSONObject(text)
+                    val dataNode = obj.optJSONObject("data") ?: obj
+                    val keys = dataNode.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val arr = dataNode.optJSONArray(key)
+                        if (arr != null && arr.length() > 0 && arr.optJSONObject(0) != null) {
+                            val tbl = jsonArrayToTable(key, arr)
+                            if (tbl.rows.isNotEmpty()) tables.add(tbl)
+                        }
                     }
                 }
             }
+            if (tables.isEmpty()) {
+                return Result.failure(IllegalStateException("ملف JSON لا يحتوي على مصفوفة سجلات قابلة للاستيراد."))
+            }
+            val best = pickBestCustomerTable(tables)
+            val mapping = suggestColumnMapping(best.columns)
+            val base = ImportInspectionResult(
+                fileName = fileName,
+                format = ImportFileFormat.JSON,
+                detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
+                tables = tables,
+                selectedTableName = best.name,
+                mapping = mapping,
+                previewRows = emptyList(),
+            )
+            Result.success(rebuildPreview(base, best.name, mapping))
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            Result.failure(IllegalStateException("ملف JSON غير صالح أو تالف: ${t.message ?: "خطأ في البنية"}"))
         }
-        if (tables.isEmpty()) {
-            return Result.failure(IllegalStateException("ملف JSON لا يحتوي على مصفوفة سجلات قابلة للاستيراد."))
-        }
-        val best = pickBestCustomerTable(tables)
-        val mapping = suggestColumnMapping(best.columns)
-        val base = ImportInspectionResult(
-            fileName = fileName,
-            format = ImportFileFormat.JSON,
-            detectedSourceApp = detectAccountingAppFromTables(tables.map { it.name }, fileName),
-            tables = tables,
-            selectedTableName = best.name,
-            mapping = mapping,
-            previewRows = emptyList(),
-        )
-        return Result.success(rebuildPreview(base, best.name, mapping))
     }
 
     private fun jsonArrayToTable(name: String, arr: JSONArray): DiscoveredTable {
@@ -1055,10 +1132,10 @@ class ExternalDbInspector(
                             } else {
                                 raw
                             }
-                            if (cellColIndex >= 0) {
+                            if (cellColIndex in 0..512) {
                                 while (currentRow.size <= cellColIndex) currentRow.add("")
                                 currentRow[cellColIndex] = valStr
-                            } else {
+                            } else if (currentRow.size <= 512) {
                                 currentRow.add(valStr)
                             }
                         }
@@ -1073,12 +1150,14 @@ class ExternalDbInspector(
 
     private fun cellRefToColIndex(ref: String): Int {
         val letters = ref.takeWhile { it.isLetter() }.uppercase(Locale.US)
-        if (letters.isEmpty()) return -1
+        if (letters.isEmpty() || letters.length > 3) return -1
         var idx = 0
         for (ch in letters) {
+            if (ch !in 'A'..'Z') return -1
             idx = idx * 26 + (ch.code - 'A'.code + 1)
         }
-        return idx - 1
+        val colIdx = idx - 1
+        return if (colIdx in 0..512) colIdx else -1
     }
 
     private fun parseHtmlOrSpreadsheetMlXls(content: String): List<DiscoveredTable> {
@@ -1106,6 +1185,7 @@ class ExternalDbInspector(
 
     private fun parseBiff8Xls(bytes: ByteArray): List<DiscoveredTable> {
         val workbookStream = extractOle2WorkbookStream(bytes) ?: return emptyList()
+        if (workbookStream.size < 4) return emptyList()
         val buf = ByteBuffer.wrap(workbookStream).order(ByteOrder.LITTLE_ENDIAN)
         val sheetNames = mutableListOf<String>()
         val sheetOffsets = mutableListOf<Int>()
@@ -1134,7 +1214,7 @@ class ExternalDbInspector(
                 }
                 0x00FC -> { // SST
                     if (recLen >= 8) {
-                        val totalUnique = buf.getInt(pos + 4)
+                        val totalUnique = buf.getInt(pos + 4).coerceIn(0, 200_000)
                         parseSstRecord(workbookStream, pos + 8, pos + recLen, totalUnique, sst)
                     }
                 }
@@ -1151,9 +1231,11 @@ class ExternalDbInspector(
                         val r = buf.getShort(pos).toInt() and 0xFFFF
                         val c = buf.getShort(pos + 2).toInt() and 0xFFFF
                         val sstIdx = buf.getInt(pos + 6)
-                        val str = sst.getOrElse(sstIdx) { "" }
-                        sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
-                            .getOrPut(r) { sortedMapOf() }[c] = str
+                        if (r <= 100_000 && c <= 512) {
+                            val str = sst.getOrElse(sstIdx) { "" }
+                            sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
+                                .getOrPut(r) { sortedMapOf() }[c] = str
+                        }
                     }
                 }
                 0x0204 -> { // LABEL
@@ -1161,9 +1243,11 @@ class ExternalDbInspector(
                         val r = buf.getShort(pos).toInt() and 0xFFFF
                         val c = buf.getShort(pos + 2).toInt() and 0xFFFF
                         val len = buf.getShort(pos + 6).toInt() and 0xFFFF
-                        val str = readBiffStringData(workbookStream, pos + 8, len.coerceAtMost(recLen - 8), false)
-                        sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
-                            .getOrPut(r) { sortedMapOf() }[c] = str
+                        if (r <= 100_000 && c <= 512) {
+                            val str = readBiffStringData(workbookStream, pos + 8, len.coerceAtMost(recLen - 8), false)
+                            sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
+                                .getOrPut(r) { sortedMapOf() }[c] = str
+                        }
                     }
                 }
                 0x0203 -> { // NUMBER
@@ -1171,9 +1255,11 @@ class ExternalDbInspector(
                         val r = buf.getShort(pos).toInt() and 0xFFFF
                         val c = buf.getShort(pos + 2).toInt() and 0xFFFF
                         val d = buf.getDouble(pos + 6)
-                        val str = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
-                        sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
-                            .getOrPut(r) { sortedMapOf() }[c] = str
+                        if (r <= 100_000 && c <= 512 && d.isFinite()) {
+                            val str = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
+                            sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
+                                .getOrPut(r) { sortedMapOf() }[c] = str
+                        }
                     }
                 }
                 0x027E -> { // RK
@@ -1182,22 +1268,30 @@ class ExternalDbInspector(
                         val c = buf.getShort(pos + 2).toInt() and 0xFFFF
                         val rk = buf.getInt(pos + 6)
                         val d = decodeRk(rk)
-                        val str = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
-                        sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
-                            .getOrPut(r) { sortedMapOf() }[c] = str
+                        if (r <= 100_000 && c <= 512 && d.isFinite()) {
+                            val str = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
+                            sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
+                                .getOrPut(r) { sortedMapOf() }[c] = str
+                        }
                     }
                 }
                 0x00BD -> { // MULRK
                     if (currentSheetIdx >= 0 && recLen >= 6) {
                         val r = buf.getShort(pos).toInt() and 0xFFFF
                         val firstCol = buf.getShort(pos + 2).toInt() and 0xFFFF
-                        val count = (recLen - 6) / 6
-                        for (k in 0 until count) {
-                            val rk = buf.getInt(pos + 4 + k * 6 + 2)
-                            val d = decodeRk(rk)
-                            val str = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
-                            sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
-                                .getOrPut(r) { sortedMapOf() }[firstCol + k] = str
+                        val count = ((recLen - 6) / 6).coerceAtMost(512)
+                        if (r <= 100_000) {
+                            for (k in 0 until count) {
+                                val targetCol = firstCol + k
+                                if (targetCol > 512 || pos + 4 + k * 6 + 6 > pos + recLen) break
+                                val rk = buf.getInt(pos + 4 + k * 6 + 2)
+                                val d = decodeRk(rk)
+                                if (d.isFinite()) {
+                                    val str = if (d % 1.0 == 0.0) d.toLong().toString() else d.toString()
+                                    sheetCells.getOrPut(currentSheetIdx) { sortedMapOf() }
+                                        .getOrPut(r) { sortedMapOf() }[targetCol] = str
+                                }
+                            }
                         }
                     }
                 }
@@ -1208,7 +1302,7 @@ class ExternalDbInspector(
         val tables = mutableListOf<DiscoveredTable>()
         sheetCells.forEach { (idx, rowsMap) ->
             if (rowsMap.size >= 2) {
-                val maxCol = rowsMap.values.maxOfOrNull { it.keys.maxOrNull() ?: 0 } ?: 0
+                val maxCol = (rowsMap.values.maxOfOrNull { it.keys.maxOrNull() ?: 0 } ?: 0).coerceIn(0, 512)
                 val matrix = rowsMap.entries.sortedBy { it.key }.map { (_, colsMap) ->
                     (0..maxCol).map { c -> colsMap[c].orEmpty() }
                 }
@@ -1229,8 +1323,10 @@ class ExternalDbInspector(
         if (bytes.size < 512) return null
         val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         val sectorShift = buf.getShort(30).toInt() and 0xFFFF
+        if (sectorShift !in 6..16) return null
         val sectorSize = 1 shl sectorShift
         val firstDirSector = buf.getInt(48)
+        if (firstDirSector < 0) return null
         val fatSectors = mutableListOf<Int>()
         for (i in 0 until 109) {
             val sec = buf.getInt(76 + i * 4)
@@ -1238,23 +1334,27 @@ class ExternalDbInspector(
         }
         val fat = mutableListOf<Int>()
         for (sec in fatSectors) {
-            val off = (sec + 1) * sectorSize
-            if (off + sectorSize <= bytes.size) {
+            val offLong = (sec.toLong() + 1L) * sectorSize.toLong()
+            if (offLong >= 0L && offLong + sectorSize <= bytes.size) {
+                val off = offLong.toInt()
                 for (j in 0 until sectorSize / 4) {
                     fat.add(buf.getInt(off + j * 4))
                 }
             }
         }
         fun readChain(startSector: Int): ByteArray {
-            val out = mutableListOf<Byte>()
+            val out = java.io.ByteArrayOutputStream()
             var cur = startSector
             var guard = 0
-            while (cur >= 0 && cur < fat.size && guard++ < 100_000) {
-                val off = (cur + 1) * sectorSize
-                if (off + sectorSize <= bytes.size) {
-                    for (b in off until off + sectorSize) out.add(bytes[b])
+            val maxStreamBytes = 16 * 1024 * 1024
+            while (cur >= 0 && cur < fat.size && guard++ < 50_000 && out.size() < maxStreamBytes) {
+                val offLong = (cur.toLong() + 1L) * sectorSize.toLong()
+                if (offLong >= 0L && offLong + sectorSize <= bytes.size) {
+                    out.write(bytes, offLong.toInt(), sectorSize)
                 }
-                cur = fat[cur]
+                val next = fat[cur]
+                if (next == cur) break
+                cur = next
             }
             return out.toByteArray()
         }
@@ -1272,8 +1372,9 @@ class ExternalDbInspector(
             if (name.equals("Workbook", true) || name.equals("Book", true)) {
                 val startSec = dirBuf.getInt(entryOff + 116)
                 val size = dirBuf.getInt(entryOff + 120)
+                if (startSec < 0 || size <= 0) return null
                 val full = readChain(startSec)
-                return full.copyOf(size.coerceAtMost(full.size))
+                return full.copyOf(size.coerceIn(0, full.size))
             }
             entryOff += 128
         }
@@ -1298,17 +1399,21 @@ class ExternalDbInspector(
             }
             if (hasExt && pos + 4 <= end) {
                 extSize = buf.getInt(pos)
+                if (extSize < 0) break
                 pos += 4
             }
             val byteLen = if (isUtf16) charCount * 2 else charCount
-            if (pos + byteLen > end) break
+            if (byteLen < 0 || pos + byteLen > end) break
             out.add(readBiffStringData(data, pos, charCount, isUtf16))
-            pos += byteLen + richRuns * 4 + extSize
+            val advance = byteLen.toLong() + richRuns.toLong() * 4L + extSize.toLong()
+            if (advance <= 0L && byteLen == 0) continue
+            if (pos + advance > Int.MAX_VALUE) break
+            pos += advance.toInt()
         }
     }
 
     private fun readBiffStringData(data: ByteArray, offset: Int, charCount: Int, isUtf16: Boolean): String {
-        if (charCount <= 0 || offset >= data.size) return ""
+        if (charCount <= 0 || offset < 0 || offset >= data.size) return ""
         return if (isUtf16) {
             val end = (offset + charCount * 2).coerceAtMost(data.size)
             String(data, offset, end - offset, Charsets.UTF_16LE)

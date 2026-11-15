@@ -17,6 +17,8 @@ import androidx.compose.material.icons.filled.CurrencyExchange
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Sms
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -28,6 +30,7 @@ import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -47,6 +50,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.example.data.update.AppUpdateChecker
+import com.example.data.update.AppUpdateState
 import com.example.security.BiometricAuthHelper
 import com.example.security.findFragmentActivity
 import com.example.ui.SmartDebtViewModel
@@ -84,24 +89,31 @@ class MainActivity : FragmentActivity() {
             )
             val settings by vm.settings.collectAsStateWithLifecycle()
             val isUnlocked by vm.isSessionUnlocked.collectAsStateWithLifecycle()
+            val updateState by vm.updateState.collectAsStateWithLifecycle()
             var biometricError by remember { mutableStateOf<String?>(null) }
 
             val triggerBiometricPrompt = {
-                BiometricAuthHelper.authenticate(
-                    activity = this,
-                    onSuccess = {
-                        biometricError = null
-                        vm.unlockSession()
-                    },
-                    onError = { err ->
-                        biometricError = err
-                    },
-                )
+                runCatching {
+                    BiometricAuthHelper.authenticate(
+                        activity = this,
+                        onSuccess = {
+                            biometricError = null
+                            vm.unlockSession()
+                        },
+                        onError = { err ->
+                            biometricError = err
+                        },
+                    )
+                }.onFailure { err ->
+                    biometricError = err.message ?: "تعذر تشغيل التحقق بالبصمة"
+                }
             }
 
             SmartDebtTheme(
                 themeMode = settings.themeMode,
                 colorPalette = settings.colorPalette,
+                backgroundStyle = settings.backgroundStyle,
+                iconShape = settings.iconShape,
             ) {
                 if (settings.biometricLockEnabled && !isUnlocked) {
                     LaunchedEffect(Unit) {
@@ -114,6 +126,31 @@ class MainActivity : FragmentActivity() {
                     )
                 } else {
                     SmartDebtAppRoot(viewModel = vm)
+                    val availableUpdate = updateState as? AppUpdateState.UpdateAvailable
+                    if (availableUpdate != null) {
+                        AlertDialog(
+                            onDismissRequest = { vm.dismissUpdatePrompt() },
+                            title = { Text("يتوفر تحديث جديد للتطبيق (v${availableUpdate.latestVersionName})") },
+                            text = { Text(availableUpdate.releaseNotes) },
+                            confirmButton = {
+                                if (availableUpdate.downloadUrl.isNotBlank()) {
+                                    Button(
+                                        onClick = {
+                                            AppUpdateChecker.openDownloadUrl(this@MainActivity, availableUpdate.downloadUrl)
+                                            vm.dismissUpdatePrompt()
+                                        }
+                                    ) {
+                                        Text("تحديث الآن")
+                                    }
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { vm.dismissUpdatePrompt() }) {
+                                    Text("لاحقاً")
+                                }
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -168,6 +205,7 @@ fun SmartDebtAppRoot(viewModel: SmartDebtViewModel) {
         val useRail = maxWidth >= 600.dp
 
         Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
             contentWindowInsets = WindowInsets.safeDrawing,
             snackbarHost = {
                 SnackbarHost(hostState = snackbarHostState) { data ->

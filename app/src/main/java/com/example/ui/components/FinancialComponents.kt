@@ -97,6 +97,7 @@ import androidx.compose.ui.unit.dp
 import com.example.data.importexport.PaymentReceiptPdfGenerator
 import com.example.data.local.CustomerWithBalance
 import com.example.data.local.TransactionWithCustomer
+import com.example.ui.theme.LocalAppIconShape
 import com.example.ui.theme.LocalFinancialColors
 import com.example.util.FormatUtils
 import java.util.Calendar
@@ -204,8 +205,8 @@ fun KpiTile(
                 )
                 Box(
                     modifier = Modifier
-                        .size(34.dp)
-                        .clip(CircleShape)
+                        .size(36.dp)
+                        .clip(LocalAppIconShape.current)
                         .background(accentColor.copy(alpha = 0.14f)),
                     contentAlignment = Alignment.Center,
                 ) {
@@ -280,7 +281,7 @@ fun EmptyStateView(
         Box(
             modifier = Modifier
                 .size(72.dp)
-                .clip(CircleShape)
+                .clip(LocalAppIconShape.current)
                 .background(MaterialTheme.colorScheme.primaryContainer),
             contentAlignment = Alignment.Center,
         ) {
@@ -1138,7 +1139,7 @@ fun BiometricLockScreen(
                     Box(
                         modifier = Modifier
                             .size(78.dp)
-                            .clip(CircleShape)
+                            .clip(LocalAppIconShape.current)
                             .background(MaterialTheme.colorScheme.primaryContainer),
                         contentAlignment = Alignment.Center,
                     ) {

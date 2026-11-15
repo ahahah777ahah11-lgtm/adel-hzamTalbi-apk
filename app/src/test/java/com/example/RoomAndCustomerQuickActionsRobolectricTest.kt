@@ -9,6 +9,8 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.importexport.BackupManager
@@ -27,6 +29,11 @@ import com.example.data.sms.SmsTemplateEngine
 import com.example.ui.SmartDebtViewModel
 import com.example.ui.navigation.AppRoutes
 import com.example.ui.screens.CustomersScreen
+import com.example.ui.screens.SettingsScreen
+import com.example.ui.theme.AppBackgroundStyle
+import com.example.ui.theme.AppColorPalette
+import com.example.ui.theme.AppIconShape
+import com.example.ui.theme.AppThemeMode
 import com.example.ui.theme.SmartDebtTheme
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -310,6 +317,60 @@ class RoomAndCustomerQuickActionsRobolectricTest {
 
         assertTrue(visitedRoutes.contains(AppRoutes.addDebt(cid)))
         assertTrue(visitedRoutes.contains(AppRoutes.addPayment(cid)))
+    }
+
+    @Test
+    fun `settings screen updates theme palette background color and icon shape and persists across backup`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val settingsStore = SettingsDataStore(app)
+        val backupMgr = BackupManager(db, settingsStore)
+        val vm = SmartDebtViewModel(
+            application = app,
+            repository = repo,
+            settingsDataStore = settingsStore,
+            backupManager = backupMgr,
+            exportManager = ExportManager(),
+            inspector = ExternalDbInspector(db, backupMgr),
+        )
+
+        composeRule.setContent {
+            val currentSettings = vm.settings.collectAsStateWithLifecycle().value
+            SmartDebtTheme(
+                themeMode = currentSettings.themeMode,
+                colorPalette = currentSettings.colorPalette,
+                backgroundStyle = currentSettings.backgroundStyle,
+                iconShape = currentSettings.iconShape,
+            ) {
+                SettingsScreen(viewModel = vm, onBack = {})
+            }
+        }
+
+        composeRule.onNodeWithTag("appearance_live_preview").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("theme_mode_${AppThemeMode.DARK.name}").performScrollTo().performClick()
+        composeRule.onNodeWithTag("palette_${AppColorPalette.EMERALD_FINANCE.name}").performScrollTo().performClick()
+        composeRule.onNodeWithTag("bg_style_${AppBackgroundStyle.WARM_CREAM.name}").performScrollTo().performClick()
+        composeRule.onNodeWithTag("icon_shape_${AppIconShape.DIAMOND_CUT.name}").performScrollTo().performClick()
+
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            val cur = runBlocking { settingsStore.getSettingsOnce() }
+            cur.themeMode == AppThemeMode.DARK &&
+                cur.colorPalette == AppColorPalette.EMERALD_FINANCE &&
+                cur.backgroundStyle == AppBackgroundStyle.WARM_CREAM &&
+                cur.iconShape == AppIconShape.DIAMOND_CUT
+        }
+
+        val saved = settingsStore.getSettingsOnce()
+        assertEquals(AppThemeMode.DARK, saved.themeMode)
+        assertEquals(AppColorPalette.EMERALD_FINANCE, saved.colorPalette)
+        assertEquals(AppBackgroundStyle.WARM_CREAM, saved.backgroundStyle)
+        assertEquals(AppIconShape.DIAMOND_CUT, saved.iconShape)
+
+        val backupJson = backupMgr.createBackupJsonString()
+        val parsed = backupMgr.inspectBackupJson(backupJson)
+        assertTrue(parsed.isValid)
+        assertEquals(AppBackgroundStyle.WARM_CREAM, parsed.data?.settings?.backgroundStyle)
+        assertEquals(AppIconShape.DIAMOND_CUT, parsed.data?.settings?.iconShape)
     }
 }
 

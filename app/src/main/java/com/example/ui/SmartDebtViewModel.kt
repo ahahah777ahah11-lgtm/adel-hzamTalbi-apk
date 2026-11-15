@@ -7,6 +7,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.data.ai.AiAutoFeatureType
+import com.example.data.ai.AiGeneratedFeatureResult
+import com.example.data.ai.AiRepository
+import com.example.data.ai.PlaceholderAiRepository
 import com.example.data.assistant.AssistantMessage
 import com.example.data.assistant.LocalSmartAssistant
 import com.example.data.importexport.BackupManager
@@ -40,9 +44,16 @@ import com.example.data.preferences.SettingsDataStore
 import com.example.data.sms.DirectSmsSender
 import com.example.data.sms.SmsDispatchResult
 import com.example.data.sms.SmsTemplateEngine
+import com.example.data.update.AppUpdateChecker
+import com.example.data.update.AppUpdateState
+import com.example.ui.theme.AppBackgroundStyle
 import com.example.ui.theme.AppColorPalette
+import com.example.ui.theme.AppIconShape
 import com.example.ui.theme.AppThemeMode
+import com.example.util.BalanceShareHelper
 import com.example.worker.OverdueReminderWorker
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -65,9 +76,18 @@ class SmartDebtViewModel(
     val backupManager: BackupManager,
     val exportManager: ExportManager,
     val inspector: ExternalDbInspector,
+    private val aiRepository: AiRepository = PlaceholderAiRepository(),
 ) : AndroidViewModel(application) {
 
     private val assistant = LocalSmartAssistant()
+    private val safeHandler = CoroutineExceptionHandler { _, throwable ->
+        viewModelScope.launch {
+            _importBusy.value = false
+            _feedback.emit(
+                UiFeedback("تم تدارك خطأ غير متوقع بأمان: ${throwable.message ?: "يرجى المحاولة مجدداً"}", isError = true)
+            )
+        }
+    }
 
     val settings: StateFlow<AppSettings> = settingsDataStore.settingsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSettings())
@@ -134,10 +154,27 @@ class SmartDebtViewModel(
     )
     val assistantMessages: StateFlow<List<AssistantMessage>> = _assistantMessages.asStateFlow()
 
+    // AI Auto-Feature State (Placeholder when Firebase is not enabled)
+    private val _aiFeatureResult = MutableStateFlow<AiGeneratedFeatureResult?>(null)
+    val aiFeatureResult: StateFlow<AiGeneratedFeatureResult?> = _aiFeatureResult.asStateFlow()
+
+    // App Update Checker State
+    private val _updateState = MutableStateFlow<AppUpdateState>(AppUpdateState.Idle)
+    val updateState: StateFlow<AppUpdateState> = _updateState.asStateFlow()
+
     init {
-        viewModelScope.launch(Dispatchers.IO) {
-            repository.refreshOverdueStatuses()
-            refreshLocalBackups()
+        viewModelScope.launch(Dispatchers.IO + safeHandler) {
+            runCatching { repository.refreshOverdueStatuses() }
+            runCatching { refreshLocalBackups() }
+            runCatching {
+                val cfg = settingsDataStore.getSettingsOnce()
+                if (cfg.autoUpdateCheckEnabled && cfg.updateManifestUrl.isNotBlank()) {
+                    val result = AppUpdateChecker.checkForUpdates(cfg.updateManifestUrl)
+                    if (result is AppUpdateState.UpdateAvailable) {
+                        _updateState.value = result
+                    }
+                }
+            }
         }
     }
 
@@ -577,48 +614,66 @@ class SmartDebtViewModel(
         }
     }
 
-    // Import workflow
+    // Import workflow (crash-hardened with CancellationException preservation & finally cleanup)
     fun inspectImportUri(uri: Uri) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeHandler) {
             _importBusy.value = true
             _importReport.value = null
-            val res = withContext(Dispatchers.IO) {
-                inspector.inspectUri(getApplication(), uri)
+            try {
+                val res = withContext(Dispatchers.IO) {
+                    inspector.inspectUri(getApplication(), uri)
+                }
+                res.onSuccess {
+                    _importInspection.value = it
+                    emitFeedback("تم فحص الملف بنجاح: ${it.previewRows.size} سجل مكتشف")
+                }.onFailure { err ->
+                    emitFeedback(err.message ?: "فشل قراءة الملف", isError = true)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                emitFeedback("تعذر معالجة الملف: ${t.message ?: "ملف غير صالح"}", isError = true)
+            } finally {
+                _importBusy.value = false
             }
-            res.onSuccess {
-                _importInspection.value = it
-                emitFeedback("تم فحص الملف بنجاح: ${it.previewRows.size} سجل مكتشف")
-            }.onFailure { err ->
-                emitFeedback(err.message ?: "فشل قراءة الملف", isError = true)
-            }
-            _importBusy.value = false
         }
     }
 
     fun updateImportMapping(tableName: String, mapping: ColumnMapping) {
         val current = _importInspection.value ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safeHandler) {
             _importBusy.value = true
-            val updated = withContext(Dispatchers.IO) {
-                inspector.rebuildPreview(current, tableName, mapping)
+            try {
+                val updated = withContext(Dispatchers.IO) {
+                    inspector.rebuildPreview(current, tableName, mapping)
+                }
+                _importInspection.value = updated
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                emitFeedback("تعذر تحديث معاينة الأعمدة: ${t.message}", isError = true)
+            } finally {
+                _importBusy.value = false
             }
-            _importInspection.value = updated
-            _importBusy.value = false
         }
     }
 
     fun confirmAndExecuteImport(createSafetyBackup: Boolean) {
         val current = _importInspection.value ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safeHandler) {
             _importBusy.value = true
-            val report = withContext(Dispatchers.IO) {
-                inspector.executeImport(getApplication(), current, createSafetyBackup)
+            try {
+                val report = withContext(Dispatchers.IO) {
+                    inspector.executeImport(getApplication(), current, createSafetyBackup)
+                }
+                _importReport.value = report
+                _importInspection.value = null
+                refreshLocalBackups()
+                emitFeedback("اكتمل الاستيراد: ${report.importedCustomersCount} عميل، ${report.importedTransactionsCount} عملية")
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                emitFeedback("فشل تنفيذ الاستيراد بأمان دون تعديل قاعدة البيانات: ${t.message}", isError = true)
+            } finally {
+                _importBusy.value = false
             }
-            _importReport.value = report
-            _importInspection.value = null
-            refreshLocalBackups()
-            emitFeedback("اكتمل الاستيراد: ${report.importedCustomersCount} عميل، ${report.importedTransactionsCount} عملية")
-            _importBusy.value = false
         }
     }
 
@@ -829,9 +884,19 @@ class SmartDebtViewModel(
         }
     }
 
-    fun updateTheme(themeMode: AppThemeMode, palette: AppColorPalette) {
+    fun updateTheme(
+        themeMode: AppThemeMode,
+        palette: AppColorPalette,
+        backgroundStyle: AppBackgroundStyle = settings.value.backgroundStyle,
+        iconShape: AppIconShape = settings.value.iconShape,
+    ) {
         viewModelScope.launch {
-            settingsDataStore.updateTheme(themeMode, palette)
+            settingsDataStore.updateTheme(
+                themeMode = themeMode,
+                colorPalette = palette,
+                backgroundStyle = backgroundStyle,
+                iconShape = iconShape,
+            )
         }
     }
 
@@ -889,6 +954,63 @@ class SmartDebtViewModel(
 
     fun lockSession() {
         _isSessionUnlocked.value = false
+    }
+
+    // Share Customer Balance
+    fun shareCustomerBalance(context: Context, customer: CustomerWithBalance) {
+        val launched = BalanceShareHelper.shareCustomerBalance(context, customer, settings.value)
+        if (launched) {
+            emitFeedback("تم تجهيز بطاقة رصيد ${customer.name} للمشاركة")
+        } else {
+            emitFeedback("تعذر فتح نافذة المشاركة على هذا الجهاز.", isError = true)
+        }
+    }
+
+    // AI Automatic Feature Generator
+    fun generateAiAutoFeature(featureType: AiAutoFeatureType, customer: CustomerWithBalance? = null) {
+        viewModelScope.launch(safeHandler) {
+            val result = aiRepository.generateAutoFeature(
+                featureType = featureType,
+                summary = dashboardSummary.value,
+                customer = customer,
+                settings = settings.value,
+            )
+            _aiFeatureResult.value = result
+        }
+    }
+
+    fun clearAiFeatureResult() {
+        _aiFeatureResult.value = null
+    }
+
+    // Automatic App Update Checker
+    fun setAutoUpdateSettings(enabled: Boolean, manifestUrl: String? = null) {
+        viewModelScope.launch(safeHandler) {
+            settingsDataStore.updateAutoUpdateSettings(enabled, manifestUrl)
+            emitFeedback("تم حفظ إعدادات التحديث التلقائي للتطبيق")
+        }
+    }
+
+    fun checkForAppUpdatesNow(customManifestUrl: String? = null) {
+        viewModelScope.launch(safeHandler) {
+            _updateState.value = AppUpdateState.Checking
+            val targetUrl = customManifestUrl ?: settings.value.updateManifestUrl
+            val state = AppUpdateChecker.checkForUpdates(targetUrl)
+            _updateState.value = state
+            when (state) {
+                is AppUpdateState.UpdateAvailable ->
+                    emitFeedback("يتوفر إصدار جديد: v${state.latestVersionName}")
+                is AppUpdateState.UpToDate ->
+                    emitFeedback(state.message)
+                is AppUpdateState.CheckError ->
+                    emitFeedback(state.message, isError = true)
+                else -> Unit
+            }
+        }
+    }
+
+    fun dismissUpdatePrompt() {
+        _updateState.value = AppUpdateState.Idle
     }
 
     // Assistant

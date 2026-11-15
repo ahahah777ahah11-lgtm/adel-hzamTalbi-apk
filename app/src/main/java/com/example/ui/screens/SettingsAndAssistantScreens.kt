@@ -4,8 +4,10 @@ import android.Manifest
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,13 +25,16 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Backup
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CurrencyExchange
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FileDownload
@@ -42,11 +47,15 @@ import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sms
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -54,28 +63,44 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.BuildConfig
+import com.example.data.ai.AiAutoFeatureType
+import com.example.data.ai.AiGeneratedFeatureResult
+import com.example.data.update.AppUpdateChecker
+import com.example.data.update.AppUpdateState
+import com.example.security.AppCapabilityKind
+import com.example.security.AppPermissionsManager
 import com.example.security.BiometricAuthHelper
 import com.example.security.findFragmentActivity
 import com.example.ui.SmartDebtViewModel
 import com.example.ui.components.ArabicTopBar
 import com.example.ui.components.FinancialCard
+import com.example.ui.components.StatusBadge
 import com.example.ui.navigation.AppRoutes
+import com.example.ui.theme.AppBackgroundStyle
 import com.example.ui.theme.AppColorPalette
+import com.example.ui.theme.AppIconShape
 import com.example.ui.theme.AppThemeMode
+import com.example.ui.theme.LocalAppIconShape
 import com.example.ui.theme.LocalFinancialColors
 import com.example.util.FormatUtils
 
@@ -86,6 +111,7 @@ fun SettingsScreen(
     onBack: () -> Unit,
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val updateState by viewModel.updateState.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
     val context = LocalContext.current
     val biometricAvailability = remember(context) { BiometricAuthHelper.checkAvailability(context) }
@@ -96,16 +122,42 @@ fun SettingsScreen(
     var allowOverpayment by remember(settings.allowOverpayment) { mutableStateOf(settings.allowOverpayment) }
     var duplicateWindow by remember(settings.duplicateWindowMinutes) { mutableStateOf(settings.duplicateWindowMinutes.toString()) }
     var overdueDays by remember(settings.overdueDaysThreshold) { mutableStateOf(settings.overdueDaysThreshold.toString()) }
+    var updateUrlInput by remember(settings.updateManifestUrl) { mutableStateOf(settings.updateManifestUrl) }
+    var permissionsRefreshTick by remember { mutableIntStateOf(0) }
+
+    val capabilities = remember(context, settings.workManagerRemindersEnabled, permissionsRefreshTick) {
+        AppPermissionsManager.getCapabilityStatuses(context, settings.workManagerRemindersEnabled)
+    }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
+        permissionsRefreshTick++
         if (granted) {
             viewModel.setWorkManagerReminders(true)
         } else {
             viewModel.emitFeedback("تم تفعيل الفحص في الخلفية بدون إشعارات نظام.", isError = false)
             viewModel.setWorkManagerReminders(true)
         }
+    }
+
+    val singlePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        permissionsRefreshTick++
+        if (granted) {
+            viewModel.emitFeedback("تم منح الصلاحية بنجاح")
+        } else {
+            viewModel.emitFeedback("لم يتم منح الصلاحية؛ يمكنك تفعيلها من إعدادات النظام.", isError = true)
+        }
+    }
+
+    val multiplePermissionsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        permissionsRefreshTick++
+        val grantedCount = results.values.count { it }
+        viewModel.emitFeedback("تم منح $grantedCount من أصل ${results.size} صلاحيات مطلوبة")
     }
 
     Scaffold(
@@ -157,32 +209,236 @@ fun SettingsScreen(
             }
 
             FinancialCard {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Palette, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
-                    Spacer(Modifier.width(8.dp))
-                    Text("المظهر والألوان (RTL العربية)", fontWeight = FontWeight.Bold)
+                val previewDark = when (settings.themeMode) {
+                    AppThemeMode.SYSTEM -> isSystemInDarkTheme()
+                    AppThemeMode.LIGHT -> false
+                    AppThemeMode.DARK -> true
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("وضع العرض:", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    AppThemeMode.entries.forEach { mode ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(LocalAppIconShape.current)
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.Palette,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("المظهر، ألوان الخلفية، وأشكال الأيقونات", fontWeight = FontWeight.Bold)
+                        Text(
+                            "تخصيص فوري ينعكس على كافة الشاشات (RTL)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                // Live preview strip of active background, theme primary, and icon shape
+                Surface(
+                    color = MaterialTheme.colorScheme.background,
+                    shape = MaterialTheme.shapes.medium,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("appearance_live_preview"),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(LocalAppIconShape.current)
+                                .background(MaterialTheme.colorScheme.primary),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Default.Widgets,
+                                contentDescription = "معاينة شكل الأيقونة",
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(22.dp),
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "${settings.colorPalette.titleAr} • ${settings.backgroundStyle.titleAr}",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = "شكل الأيقونات: ${settings.iconShape.titleAr}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("وضع العرض:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(AppThemeMode.entries) { mode ->
                         FilterChip(
                             selected = settings.themeMode == mode,
                             onClick = { viewModel.updateTheme(mode, settings.colorPalette) },
                             label = { Text(mode.titleAr) },
+                            modifier = Modifier.testTag("theme_mode_${mode.name}"),
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("لوحة الألوان:", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    AppColorPalette.entries.forEach { pal ->
-                        FilterChip(
-                            selected = settings.colorPalette == pal,
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("لوحة ألوان الثيم:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(AppColorPalette.entries) { pal ->
+                        val selected = settings.colorPalette == pal
+                        Surface(
                             onClick = { viewModel.updateTheme(settings.themeMode, pal) },
-                            label = { Text(pal.titleAr) },
+                            shape = MaterialTheme.shapes.small,
+                            color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) pal.previewPrimary else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                            ),
                             modifier = Modifier.testTag("palette_${pal.name}"),
-                        )
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(22.dp)
+                                        .clip(CircleShape)
+                                        .background(pal.previewPrimary),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (selected) {
+                                        Icon(
+                                            Icons.Default.Check,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(14.dp),
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = pal.titleAr,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("لون الخلفية:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(AppBackgroundStyle.entries) { bg ->
+                        val selected = settings.backgroundStyle == bg
+                        val swatchColor = if (previewDark) bg.darkPreview else bg.lightPreview
+                        Surface(
+                            onClick = {
+                                viewModel.updateTheme(
+                                    themeMode = settings.themeMode,
+                                    palette = settings.colorPalette,
+                                    backgroundStyle = bg,
+                                )
+                            },
+                            shape = MaterialTheme.shapes.small,
+                            color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                            ),
+                            modifier = Modifier.testTag("bg_style_${bg.name}"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = swatchColor,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                                    modifier = Modifier.size(22.dp),
+                                ) {}
+                                Text(
+                                    text = bg.titleAr,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("شكل الأيقونات المميز:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(AppIconShape.entries) { shapeOption ->
+                        val selected = settings.iconShape == shapeOption
+                        Surface(
+                            onClick = {
+                                viewModel.updateTheme(
+                                    themeMode = settings.themeMode,
+                                    palette = settings.colorPalette,
+                                    iconShape = shapeOption,
+                                )
+                            },
+                            shape = MaterialTheme.shapes.small,
+                            color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                            border = BorderStroke(
+                                width = if (selected) 2.dp else 1.dp,
+                                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                            ),
+                            modifier = Modifier.testTag("icon_shape_${shapeOption.name}"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(26.dp)
+                                        .clip(shapeOption.shape)
+                                        .background(MaterialTheme.colorScheme.primary),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        Icons.Default.Palette,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onPrimary,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                }
+                                Text(
+                                    text = shapeOption.titleAr,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -333,6 +589,217 @@ fun SettingsScreen(
                 }
             }
 
+            FinancialCard(modifier = Modifier.testTag("permissions_hub_card")) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(LocalAppIconShape.current)
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.AdminPanelSettings,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("مركز الصلاحيات والخدمات المتاحة", fontWeight = FontWeight.Bold)
+                        Text(
+                            "الملفات، الإشعارات، التذكيرات، جهات الاتصال، الكاميرا، الموقع، وSMS",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                capabilities.forEachIndexed { idx, cap ->
+                    if (idx > 0) HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(cap.kind.titleAr, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                cap.kind.descriptionAr,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (cap.isGranted) {
+                            StatusBadge("مفعّل", financial.success)
+                        } else if (cap.kind == AppCapabilityKind.REMINDERS) {
+                            OutlinedButton(onClick = { viewModel.setWorkManagerReminders(true) }) {
+                                Text("تفعيل")
+                            }
+                        } else if (cap.kind.permission != null) {
+                            OutlinedButton(
+                                onClick = {
+                                    if (cap.kind == AppCapabilityKind.LOCATION) {
+                                        multiplePermissionsLauncher.launch(
+                                            arrayOf(
+                                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                                Manifest.permission.ACCESS_COARSE_LOCATION,
+                                            )
+                                        )
+                                    } else {
+                                        singlePermissionLauncher.launch(cap.kind.permission)
+                                    }
+                                },
+                                modifier = Modifier.testTag("grant_perm_${cap.kind.name}"),
+                            ) {
+                                Text("منح")
+                            }
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = {
+                            val missing = AppPermissionsManager.missingRuntimePermissions(context)
+                            if (missing.isEmpty()) {
+                                viewModel.emitFeedback("جميع صلاحيات التطبيق متاحة ومفعّلة بالفعل")
+                            } else {
+                                multiplePermissionsLauncher.launch(missing)
+                            }
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("grant_all_permissions_button"),
+                    ) {
+                        Text("تفعيل جميع الصلاحيات")
+                    }
+                    OutlinedButton(
+                        onClick = { AppPermissionsManager.openAppPermissionSettings(context) },
+                        modifier = Modifier.testTag("open_system_perm_settings_button"),
+                    ) {
+                        Text("إعدادات النظام")
+                    }
+                }
+            }
+
+            FinancialCard(modifier = Modifier.testTag("app_update_card")) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(LocalAppIconShape.current)
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.SystemUpdate,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("التحديث التلقائي للتطبيق", fontWeight = FontWeight.Bold)
+                        Text(
+                            "الإصدار المثبت حالياً: v${BuildConfig.VERSION_NAME} (رمز ${BuildConfig.VERSION_CODE})",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("التحقق التلقائي عند تشغيل التطبيق", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "يعمل بأمان عند توفر رابط بيان التحديثات ولا يؤثر على العمل دون إنترنت.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = settings.autoUpdateCheckEnabled,
+                        onCheckedChange = { enabled ->
+                            viewModel.setAutoUpdateSettings(enabled, updateUrlInput)
+                        },
+                        modifier = Modifier.testTag("auto_update_switch"),
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = updateUrlInput,
+                    onValueChange = { updateUrlInput = it },
+                    label = { Text("رابط بيان التحديثات JSON (اختياري)") },
+                    placeholder = { Text("https://example.com/smartdebt-update.json") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("update_manifest_url_input"),
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = {
+                            viewModel.setAutoUpdateSettings(settings.autoUpdateCheckEnabled, updateUrlInput)
+                            viewModel.checkForAppUpdatesNow(updateUrlInput)
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("check_updates_now_button"),
+                    ) {
+                        Text("فحص التحديثات الآن")
+                    }
+                }
+                when (val st = updateState) {
+                    AppUpdateState.Checking -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    is AppUpdateState.UpToDate -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(st.message, style = MaterialTheme.typography.bodySmall, color = financial.success)
+                    }
+                    is AppUpdateState.UpdateAvailable -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = MaterialTheme.shapes.small,
+                        ) {
+                            Column(modifier = Modifier.fillMaxWidth().padding(10.dp)) {
+                                Text("يتوفر تحديث جديد: v${st.latestVersionName}", fontWeight = FontWeight.Bold)
+                                Text(st.releaseNotes, style = MaterialTheme.typography.bodySmall)
+                                if (st.downloadUrl.isNotBlank()) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    OutlinedButton(
+                                        onClick = { AppUpdateChecker.openDownloadUrl(context, st.downloadUrl) },
+                                    ) {
+                                        Text("فتح رابط التحديث")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    is AppUpdateState.CheckError -> {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(st.message, style = MaterialTheme.typography.bodySmall, color = financial.orange)
+                    }
+                    AppUpdateState.Idle -> Unit
+                }
+            }
+
             FinancialCard(containerColor = MaterialTheme.colorScheme.primaryContainer) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.Security, contentDescription = null, tint = financial.success)
@@ -358,6 +825,8 @@ fun LocalAssistantScreen(
 ) {
     val messages by viewModel.assistantMessages.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val aiFeatureResult by viewModel.aiFeatureResult.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -382,8 +851,72 @@ fun LocalAssistantScreen(
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background),
         ) {
+            FinancialCard(
+                modifier = Modifier
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .testTag("ai_auto_features_card"),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(8.dp))
+                    Text("ميزة الاقتراح والتوليد التلقائي بالذكاء الاصطناعي (AI)", fontWeight = FontWeight.Bold)
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Text(
+                        text = AiGeneratedFeatureResult.FIREBASE_REQUIRED_NOTICE_AR,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(8.dp)
+                            .testTag("ai_firebase_notice_banner"),
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(AiAutoFeatureType.entries) { ft ->
+                        FilterChip(
+                            selected = aiFeatureResult?.featureType == ft,
+                            onClick = { viewModel.generateAiAutoFeature(ft) },
+                            label = { Text(ft.titleAr) },
+                            modifier = Modifier.testTag("ai_feature_chip_${ft.name}"),
+                        )
+                    }
+                }
+                aiFeatureResult?.let { res ->
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(10.dp)) {
+                            Text(res.title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(res.content, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("ai_generated_content"))
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = {
+                                        clipboard.setText(AnnotatedString(res.content))
+                                        viewModel.emitFeedback("تم نسخ المخرج المقترح")
+                                    }
+                                ) {
+                                    Text("نسخ")
+                                }
+                                TextButton(onClick = { viewModel.clearAiFeatureResult() }) {
+                                    Text("إخفاء")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             LazyRow(
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(viewModel.getQuickAssistantPrompts()) { prompt ->
@@ -528,7 +1061,20 @@ fun MoreHubScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
-                    Icon(icon, contentDescription = title, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(LocalAppIconShape.current)
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            icon,
+                            contentDescription = title,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
                     Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 }
             }
