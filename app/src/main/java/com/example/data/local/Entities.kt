@@ -1,10 +1,12 @@
 package com.example.data.local
 
 import androidx.room.ColumnInfo
+import androidx.room.Embedded
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import androidx.room.Relation
 
 enum class TransactionType(val labelAr: String, val isDebit: Boolean) {
     DEBT("دين", true),
@@ -163,6 +165,32 @@ data class PaymentsEntity(
 )
 
 typealias Payments = PaymentsEntity
+
+/**
+ * Room one-to-many relational models linking Customers with Debts (and Payments).
+ */
+data class CustomerWithDebts(
+    @Embedded val customer: CustomerEntity,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "customer_id",
+    )
+    val debts: List<DebtsEntity>,
+)
+
+data class CustomerWithDebtsAndPayments(
+    @Embedded val customer: CustomerEntity,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "customer_id",
+    )
+    val debts: List<DebtsEntity>,
+    @Relation(
+        parentColumn = "id",
+        entityColumn = "customer_id",
+    )
+    val payments: List<PaymentsEntity>,
+)
 
 @Entity(
     tableName = "reminders",

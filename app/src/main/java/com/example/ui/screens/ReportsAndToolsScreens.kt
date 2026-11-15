@@ -18,18 +18,26 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Backup
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Print
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -43,12 +51,14 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -86,6 +96,7 @@ fun ReportsScreen(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
+    val context = LocalContext.current
 
     Scaffold(
         topBar = {
@@ -134,14 +145,79 @@ fun ReportsScreen(
                         currency = cur,
                     )
                     Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = { onNavigate(AppRoutes.EXPORT_DATA) },
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Icon(Icons.Default.FileDownload, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("تصدير التقرير إلى Excel / CSV / JSON")
+                        Button(
+                            onClick = { viewModel.printPortfolioStatement(context) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("print_portfolio_statement_button"),
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("طباعة الكشف الشامل")
+                        }
+                        OutlinedButton(
+                            onClick = { onNavigate(AppRoutes.EXPORT_DATA) },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Icon(Icons.Default.FileDownload, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("تصدير Excel/CSV")
+                        }
                     }
+                }
+            }
+
+            item {
+                val now = System.currentTimeMillis()
+                val activeDebts = transactions.filter { !it.isReversed && it.type.isDebit }
+                val bucket0to7 = activeDebts.filter { (now - it.transactionDate) <= 7L * 86_400_000L }.sumOf { it.amount }
+                val bucket8to30 = activeDebts.filter {
+                    val age = now - it.transactionDate
+                    age > 7L * 86_400_000L && age <= 30L * 86_400_000L
+                }.sumOf { it.amount }
+                val bucketOver30 = activeDebts.filter { (now - it.transactionDate) > 30L * 86_400_000L }.sumOf { it.amount }
+                val collectionRate = if (summary.totalDebts > 0.001) {
+                    ((summary.totalPayments / summary.totalDebts) * 100.0).coerceIn(0.0, 100.0)
+                } else 100.0
+                val avgDebtPerDebtor = if (summary.activeDebtorsCount > 0) {
+                    summary.netOutstandingBalance / summary.activeDebtorsCount
+                } else 0.0
+                val overLimitCount = customers.count { !it.isArchived && it.creditLimit > 0.0 && it.balance > it.creditLimit }
+
+                FinancialCard(modifier = Modifier.testTag("accounting_aging_kpis_card")) {
+                    Text("التحليل المحاسبي وأعمار الديون", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column {
+                            Text("نسبة التحصيل", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("${"%.1f".format(collectionRate)}%", fontWeight = FontWeight.Bold, color = financial.success)
+                        }
+                        Column {
+                            Text("متوسط المديونية", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(FormatUtils.formatAmount(avgDebtPerDebtor, cur), fontWeight = FontWeight.Bold)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("تجاوز الحد الائتماني", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "$overLimitCount عميل",
+                                fontWeight = FontWeight.Bold,
+                                color = if (overLimitCount > 0) financial.danger else financial.success,
+                            )
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    Text("أعمار الديون المقيدة:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("• من 0 إلى 7 أيام: ${FormatUtils.formatAmount(bucket0to7, cur)}")
+                    Text("• من 8 إلى 30 يوماً: ${FormatUtils.formatAmount(bucket8to30, cur)}", color = financial.orange)
+                    Text("• أكثر من 30 يوماً: ${FormatUtils.formatAmount(bucketOver30, cur)}", color = financial.danger)
                 }
             }
 
@@ -220,10 +296,22 @@ fun ImportDataScreen(
     val inspection by viewModel.importInspection.collectAsStateWithLifecycle()
     val report by viewModel.importReport.collectAsStateWithLifecycle()
     val isBusy by viewModel.importBusy.collectAsStateWithLifecycle()
+    val importError by viewModel.importError.collectAsStateWithLifecycle()
+    val authorizedFolders by viewModel.authorizedFolders.collectAsStateWithLifecycle()
+    val discoveredFolderFiles by viewModel.discoveredFolderFiles.collectAsStateWithLifecycle()
+    val folderScanBusy by viewModel.folderScanBusy.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
+    val context = LocalContext.current
 
     var createSafetyBackup by remember { mutableStateOf(true) }
     var showConfirmImport by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(report, importError) {
+        if (report != null || importError != null) {
+            listState.scrollToItem(0)
+        }
+    }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -233,12 +321,29 @@ fun ImportDataScreen(
         }
     }
 
+    val authorizeFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.onStorageFolderAuthorized(uri)
+        }
+    }
+
+    val exportErrorLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportErrorLogToUri(uri)
+        }
+    }
+
     Scaffold(
         topBar = {
             ArabicTopBar(title = "استيراد قواعد البيانات والملفات", onBack = onBack)
         },
     ) { innerPadding ->
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
@@ -256,7 +361,7 @@ fun ImportDataScreen(
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        "يدعم تطبيقات المحاسبة العربية وخصوصاً (دفتر الحسابات) و(المحاسب الذكي برو) عبر قراءة الملفات دون تعديل الأصل ودون استبدال قاعدة بيانات التطبيق.",
+                        "يدعم تطبيقات المحاسبة العربية وخصوصاً (دفتر الحسابات) و(المحاسب الذكي برو) عبر فحص سلامة SQLite (WAL/SHM) ومعالجة الأعمدة بالذكاء الاصطناعي وتصفير المعاينة السابقة تلقائياً عند اختيار ملف جديد.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -279,9 +384,127 @@ fun ImportDataScreen(
                         Spacer(Modifier.width(8.dp))
                         Text("اختيار ملف للاستيراد (منتقي الملفات)")
                     }
-                    if (isBusy) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { authorizeFolderLauncher.launch(null) },
+                        enabled = !isBusy && !folderScanBusy,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("authorize_storage_folder_import_button"),
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("منح وصول لمجلد في ذاكرة الهاتف (فحص تلقائي)")
+                    }
+                    if (isBusy || folderScanBusy) {
                         Spacer(modifier = Modifier.height(10.dp))
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
+            }
+
+            if (authorizedFolders.isNotEmpty()) {
+                item {
+                    FinancialCard(modifier = Modifier.testTag("authorized_storage_folders_card")) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("مجلدات ذاكرة الهاتف المصرح بها (${authorizedFolders.size})", fontWeight = FontWeight.Bold)
+                                Text(
+                                    authorizedFolders.joinToString(" • ") { it.displayLabel },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.scanAuthorizedFolders() },
+                                enabled = !folderScanBusy,
+                                modifier = Modifier.testTag("scan_authorized_folders_button"),
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("فحص")
+                            }
+                        }
+                        if (discoveredFolderFiles.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            HorizontalDivider()
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                "الملفات المكتشفة القابلة للاستيراد (${discoveredFolderFiles.size}):",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            discoveredFolderFiles.take(10).forEach { entry ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                        Text(entry.displayName, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            "${entry.relativePath} • ${(entry.sizeBytes / 1024).coerceAtLeast(1)} KB",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    OutlinedButton(
+                                        onClick = { viewModel.inspectImportUri(entry.documentUri) },
+                                        enabled = !isBusy,
+                                    ) {
+                                        Text("استيراد")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            importError?.let { errText ->
+                item {
+                    FinancialCard(containerColor = MaterialTheme.colorScheme.errorContainer) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Error, contentDescription = null, tint = financial.danger)
+                            Spacer(Modifier.width(8.dp))
+                            Text("حدث خطأ أثناء معالجة ملف الاستيراد", fontWeight = FontWeight.Bold, color = financial.danger)
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(errText, style = MaterialTheme.typography.bodySmall)
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = { exportErrorLogLauncher.launch("SmartDebt-ErrorLog.txt") },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("export_error_log_button"),
+                            ) {
+                                Icon(Icons.Default.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("تصدير سجل الأخطاء (.txt)")
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.shareErrorLog(context) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("share_error_log_button"),
+                            ) {
+                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("مشاركة السجل")
+                            }
+                        }
                     }
                 }
             }
@@ -292,13 +515,16 @@ fun ImportDataScreen(
                         Text("تقرير تنفيذ الاستيراد", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(6.dp))
                         Text("• المصدر المكتشف: ${rep.sourceApp}")
+                        if (rep.replacedPreviousData) {
+                            Text("• الوضع المنفذ: إزالة البيانات السابقة والاستبدال بالملف الجديد", fontWeight = FontWeight.SemiBold, color = financial.orange)
+                        }
                         Text("• العملاء المستوردون: ${rep.importedCustomersCount}", color = financial.success, fontWeight = FontWeight.Bold)
                         Text("• العمليات / الأرصدة الافتتاحية المسجلة: ${rep.importedTransactionsCount}")
                         Text("• السجلات المكررة المتجاهلة: ${rep.skippedDuplicatesCount}", color = financial.orange)
                         Text("• الأخطاء المكتشفة: ${rep.errorRowsCount}", color = if (rep.errorRowsCount > 0) financial.danger else financial.success)
                         rep.backupFilePath?.let {
                             Spacer(modifier = Modifier.height(4.dp))
-                            Text("• تم إنشاء نسخة أمان تلقائية قبل الاستيراد.", style = MaterialTheme.typography.bodySmall)
+                            Text("• تم إنشاء نسخة أمان تلقائية قبل التنفيذ.", style = MaterialTheme.typography.bodySmall)
                         }
                         if (rep.errors.isNotEmpty()) {
                             Spacer(modifier = Modifier.height(6.dp))
@@ -311,6 +537,61 @@ fun ImportDataScreen(
             }
 
             inspection?.let { insp ->
+                insp.aiAnalysis?.let { ai ->
+                    item {
+                        FinancialCard(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("معالجة الأعمدة بالذكاء الاصطناعي", fontWeight = FontWeight.Bold)
+                                }
+                                StatusBadge("ثقة ${ai.confidenceScore}%", financial.success)
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(ai.recommendedSummaryAr, style = MaterialTheme.typography.bodySmall)
+                            Spacer(modifier = Modifier.height(8.dp))
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(ai.columnSuggestions) { sug ->
+                                    Surface(
+                                        shape = MaterialTheme.shapes.small,
+                                        color = MaterialTheme.colorScheme.surface,
+                                    ) {
+                                        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                                            Text(
+                                                text = "${sug.fieldLabelAr}: ${sug.matchedColumn ?: "غير محدد"}",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                            )
+                                            Text(
+                                                text = "${sug.confidencePercent}% • ${sug.reasonAr}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { viewModel.reanalyzeImportColumnsWithAi() },
+                                enabled = !isBusy,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("ai_reanalyze_columns_button"),
+                            ) {
+                                Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("إعادة تحليل الأعمدة والمحتوى بالذكاء الاصطناعي")
+                            }
+                        }
+                    }
+                }
+
                 item {
                     FinancialCard {
                         Row(
@@ -323,6 +604,18 @@ fun ImportDataScreen(
                                 Text("الصيغة: ${insp.format.labelAr}", style = MaterialTheme.typography.bodySmall)
                             }
                             StatusBadge(insp.detectedSourceApp, MaterialTheme.colorScheme.secondary)
+                        }
+
+                        if (insp.warnings.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            insp.warnings.forEach { warn ->
+                                Text(
+                                    text = "تنبيه: $warn",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = financial.orange,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                            }
                         }
 
                         if (insp.tables.size > 1) {
@@ -391,21 +684,40 @@ fun ImportDataScreen(
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(
-                                checked = createSafetyBackup,
+                                checked = createSafetyBackup || insp.replaceExistingMode,
+                                enabled = !insp.replaceExistingMode,
                                 onCheckedChange = { createSafetyBackup = it },
                             )
                             Text("إنشاء نسخة احتياطية تلقائية قبل الحفظ (موصى به)")
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = insp.replaceExistingMode,
+                                onCheckedChange = { checked ->
+                                    if (checked) createSafetyBackup = true
+                                    viewModel.setReplacePreviousOnImport(checked)
+                                },
+                                modifier = Modifier.testTag("replace_existing_on_import_checkbox"),
+                            )
+                            Text(
+                                text = "عند استيراد الملف الجديد: إزالة ما سبق من البيانات (مع نسخة أمان تلقائية)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (insp.replaceExistingMode) financial.danger else MaterialTheme.colorScheme.onSurface,
+                                fontWeight = if (insp.replaceExistingMode) FontWeight.Bold else FontWeight.Normal,
+                            )
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
                                 onClick = { showConfirmImport = true },
                                 enabled = readyCount > 0 && !isBusy,
+                                colors = if (insp.replaceExistingMode) ButtonDefaults.buttonColors(containerColor = financial.danger)
+                                else ButtonDefaults.buttonColors(),
                                 modifier = Modifier.weight(1f).testTag("confirm_import_button"),
                             ) {
                                 Icon(Icons.Default.CheckCircle, contentDescription = null)
                                 Spacer(Modifier.width(6.dp))
-                                Text("تأكيد واستيراد ($readyCount)")
+                                Text(if (insp.replaceExistingMode) "استبدال واستيراد ($readyCount)" else "تأكيد واستيراد ($readyCount)")
                             }
                             OutlinedButton(onClick = { viewModel.clearImportState() }) {
                                 Text("إلغاء")
@@ -443,17 +755,59 @@ fun ImportDataScreen(
                     }
                 }
             }
+
+            item {
+                FinancialCard {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.BugReport, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("تشخيص أخطاء الاستيراد (ErrorLogger)", fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        "يتم تسجيل جميع استثناءات الاستيراد وفحص قواعد البيانات في Logcat وفي ملف محلي بصيغة (.txt) لتصديره عند الحاجة.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = { exportErrorLogLauncher.launch("SmartDebt-ErrorLog.txt") },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("تصدير سجل الأخطاء (.txt)")
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.shareErrorLog(context) },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("مشاركة السجل")
+                        }
+                    }
+                }
+            }
         }
     }
 
     if (showConfirmImport) {
+        val isReplace = inspection?.replaceExistingMode == true
         ConfirmSensitiveActionDialog(
-            title = "تأكيد استيراد البيانات",
-            message = "سيتم حفظ العملاء الجدد وأرصدتهم الموثقة في قاعدة البيانات المحلية${if (createSafetyBackup) " بعد أخذ نسخة احتياطية تلقائية" else ""}. هل تريد المتابعة؟",
-            confirmText = "استيراد الآن",
+            title = if (isReplace) "تأكيد استبدال البيانات واستيراد الملف" else "تأكيد استيراد البيانات",
+            message = if (isReplace) {
+                "تنبيه هام: سيتم إنشاء نسخة أمان تلقائية للبيانات الحالية ثم مسح البيانات السابقة واستبدالها بسجلات هذا الملف. هل أنت متأكد من المتابعة؟"
+            } else {
+                "سيتم حفظ العملاء الجدد وأرصدتهم الموثقة في قاعدة البيانات المحلية${if (createSafetyBackup) " بعد أخذ نسخة احتياطية تلقائية" else ""}. هل تريد المتابعة؟"
+            },
+            confirmText = if (isReplace) "نعم، استبدل واستورد الآن" else "استيراد الآن",
             onConfirm = {
                 showConfirmImport = false
-                viewModel.confirmAndExecuteImport(createSafetyBackup)
+                viewModel.confirmAndExecuteImport(
+                    createSafetyBackup = createSafetyBackup || isReplace,
+                    replacePreviousData = isReplace,
+                )
             },
             onDismiss = { showConfirmImport = false },
         )
@@ -616,6 +970,7 @@ fun BackupRestoreScreen(
     val validation by viewModel.backupValidation.collectAsStateWithLifecycle()
     val sqliteValidation by viewModel.sqliteValidation.collectAsStateWithLifecycle()
     val localBackups by viewModel.localBackups.collectAsStateWithLifecycle()
+    val authorizedFolders by viewModel.authorizedFolders.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
 
     var showRestoreConfirm by remember { mutableStateOf(false) }
@@ -626,6 +981,14 @@ fun BackupRestoreScreen(
     ) { uri ->
         if (uri != null) {
             viewModel.saveBackupToUri(uri)
+        }
+    }
+
+    val authorizeBackupFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.onStorageFolderAuthorized(uri)
         }
     }
 
@@ -666,6 +1029,61 @@ fun BackupRestoreScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            item {
+                FinancialCard(modifier = Modifier.testTag("backup_authorized_folder_card")) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("الحفظ المباشر في مجلدات ذاكرة الهاتف", fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    val writableFolder = authorizedFolders.firstOrNull { it.canWrite } ?: authorizedFolders.firstOrNull()
+                    if (writableFolder == null) {
+                        Text(
+                            "امنح التطبيق صلاحية الوصول الدائم لمجلد في ذاكرة الهاتف لحفظ النسخ الاحتياطية مباشرة دون اختيار المسار في كل مرة.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { authorizeBackupFolderLauncher.launch(null) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("backup_authorize_folder_button"),
+                        ) {
+                            Icon(Icons.Default.FolderOpen, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("اختيار مجلد حفظ دائم في الذاكرة")
+                        }
+                    } else {
+                        Text(
+                            "المجلد المفوض: ${writableFolder.displayLabel}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = financial.success,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Button(
+                                onClick = { viewModel.saveSqliteToAuthorizedFolder(writableFolder.treeUri) },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("حفظ SQLite بالمجلد")
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.saveBackupToAuthorizedFolder(writableFolder.treeUri) },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("حفظ JSON بالمجلد")
+                            }
+                        }
+                    }
+                }
+            }
+
             item {
                 FinancialCard {
                     Row(verticalAlignment = Alignment.CenterVertically) {

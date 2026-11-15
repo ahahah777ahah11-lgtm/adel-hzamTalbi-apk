@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
@@ -596,6 +597,7 @@ fun CustomersScreen(
     var customStartMillis by remember { mutableStateOf<Long?>(null) }
     var customEndMillis by remember { mutableStateOf<Long?>(null) }
     var selectedSort by remember { mutableStateOf(CustomerSortOption.HIGHEST_BALANCE) }
+    var showQuickAddCustomerDialog by remember { mutableStateOf(false) }
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
     val context = LocalContext.current
@@ -686,11 +688,22 @@ fun CustomersScreen(
                         text = "قائمة العملاء (${filtered.size})",
                         style = MaterialTheme.typography.headlineSmall,
                         fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f),
                     )
-                    FilledTonalButton(onClick = { onNavigate(AppRoutes.smsCenter()) }) {
-                        Icon(Icons.Default.Sms, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("تنبيهات SMS")
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilledTonalButton(
+                            onClick = { showQuickAddCustomerDialog = true },
+                            modifier = Modifier.testTag("quick_add_customer_button"),
+                        ) {
+                            Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("عميل جديد")
+                        }
+                        FilledTonalButton(onClick = { onNavigate(AppRoutes.smsCenter()) }) {
+                            Icon(Icons.Default.Sms, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("SMS")
+                        }
                     }
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -789,6 +802,81 @@ fun CustomersScreen(
                 }
             }
         }
+    }
+
+    if (showQuickAddCustomerDialog) {
+        var quickName by remember { mutableStateOf("") }
+        var quickPhone by remember { mutableStateOf("") }
+        var quickOpening by remember { mutableStateOf("") }
+
+        AlertDialog(
+            onDismissRequest = { showQuickAddCustomerDialog = false },
+            title = { Text("إضافة عميل جديد", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = quickName,
+                        onValueChange = { quickName = it },
+                        label = { Text("اسم العميل *") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("quick_customer_name_input"),
+                    )
+                    OutlinedTextField(
+                        value = quickPhone,
+                        onValueChange = { quickPhone = it },
+                        label = { Text("رقم الجوال") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("quick_customer_phone_input"),
+                    )
+                    AmountOutlinedField(
+                        value = quickOpening,
+                        onValueChange = { quickOpening = it },
+                        label = "دين / رصيد افتتاحي (اختياري)",
+                        currency = cur,
+                        testTag = "quick_customer_opening_input",
+                    )
+                    TextButton(
+                        onClick = {
+                            showQuickAddCustomerDialog = false
+                            onNavigate(AppRoutes.addEditCustomer())
+                        },
+                    ) {
+                        Text("فتح النموذج التفصيلي الكامل")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val openingVal = quickOpening.toDoubleOrNull() ?: 0.0
+                        viewModel.createCustomer(
+                            name = quickName,
+                            phone = quickPhone,
+                            accountNumber = "",
+                            creditLimit = 0.0,
+                            notes = "",
+                            openingBalance = openingVal,
+                            onSuccess = {
+                                showQuickAddCustomerDialog = false
+                            },
+                        )
+                    },
+                    modifier = Modifier.testTag("quick_customer_save_button"),
+                ) {
+                    Text("حفظ")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQuickAddCustomerDialog = false }) {
+                    Text("إلغاء")
+                }
+            },
+        )
     }
 }
 
@@ -1218,6 +1306,12 @@ fun CustomerDetailScreen(
                 onBack = onBack,
                 actions = {
                     customer?.let { c ->
+                        IconButton(
+                            onClick = { viewModel.printCustomerStatement(context, c, txs) },
+                            modifier = Modifier.testTag("detail_print_statement_button"),
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = "طباعة كشف الحساب")
+                        }
                         IconButton(
                             onClick = { viewModel.shareCustomerBalance(context, c) },
                             modifier = Modifier.testTag("topbar_share_balance_button"),

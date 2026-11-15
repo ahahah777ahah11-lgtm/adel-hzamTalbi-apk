@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -113,6 +114,18 @@ interface CustomerDao {
 
     @Update
     suspend fun update(customer: CustomerEntity)
+
+    @Transaction
+    @Query("SELECT * FROM customers ORDER BY name ASC")
+    fun observeCustomersWithDebts(): Flow<List<CustomerWithDebts>>
+
+    @Transaction
+    @Query("SELECT * FROM customers WHERE id = :customerId")
+    suspend fun getCustomerWithDebts(customerId: Long): CustomerWithDebts?
+
+    @Transaction
+    @Query("SELECT * FROM customers WHERE id = :customerId")
+    suspend fun getCustomerWithDebtsAndPayments(customerId: Long): CustomerWithDebtsAndPayments?
 
     @Query("DELETE FROM customers")
     suspend fun deleteAll()

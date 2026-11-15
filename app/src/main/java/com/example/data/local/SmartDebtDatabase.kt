@@ -108,8 +108,15 @@ abstract class SmartDebtDatabase : RoomDatabase() {
         private var INSTANCE: SmartDebtDatabase? = null
 
         fun getInstance(context: Context): SmartDebtDatabase {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: buildDatabase(context.applicationContext).also { INSTANCE = it }
+            val current = INSTANCE
+            if (current != null && current.isOpen) return current
+            return synchronized(this) {
+                val existing = INSTANCE
+                if (existing != null && existing.isOpen) {
+                    existing
+                } else {
+                    buildDatabase(context.applicationContext).also { INSTANCE = it }
+                }
             }
         }
 
@@ -129,6 +136,15 @@ abstract class SmartDebtDatabase : RoomDatabase() {
                     }
                 })
                 .build()
+        }
+
+        fun checkpointWal(database: SmartDebtDatabase): Boolean {
+            return runCatching {
+                database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(FULL)").use { c ->
+                    c.moveToFirst()
+                }
+                true
+            }.getOrDefault(false)
         }
 
         suspend fun seedDefaultTemplates(dao: SmsTemplateDao) {

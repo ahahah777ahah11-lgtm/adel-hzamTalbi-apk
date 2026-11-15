@@ -29,6 +29,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MarkEmailRead
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material3.AlertDialog
@@ -89,6 +91,7 @@ fun SmsCenterScreen(
     val customers by viewModel.customers.collectAsStateWithLifecycle()
     val templates by viewModel.smsTemplates.collectAsStateWithLifecycle()
     val messageLogs by viewModel.messageLogs.collectAsStateWithLifecycle()
+    val smsInboxMessages by viewModel.smsInboxMessages.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
@@ -101,6 +104,7 @@ fun SmsCenterScreen(
     var editablePreviewBody by remember { mutableStateOf("") }
 
     var hasSmsPermission by remember { mutableStateOf(DirectSmsSender.hasSendSmsPermission(context)) }
+    var hasReadSmsPermission by remember { mutableStateOf(DirectSmsSender.hasReadSmsPermission(context)) }
     var permissionDeniedExplicitly by remember { mutableStateOf(false) }
     var showBulkConfirmDialog by remember { mutableStateOf(false) }
     var pendingDirectAction by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -121,6 +125,17 @@ fun SmsCenterScreen(
             )
         }
         pendingDirectAction = null
+    }
+
+    val readSmsPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        hasReadSmsPermission = granted
+        if (granted) {
+            viewModel.loadSmsInboxMessages(context)
+        } else {
+            viewModel.emitFeedback("لم يتم منح صلاحية قراءة الرسائل (READ_SMS).", isError = true)
+        }
     }
 
     LaunchedEffect(templates) {
@@ -174,12 +189,17 @@ fun SmsCenterScreen(
                 Tab(
                     selected = tabIndex == 0,
                     onClick = { tabIndex = 0 },
-                    text = { Text("إنشاء وإرسال (${selectedCustomers.size})") },
+                    text = { Text("إرسال (${selectedCustomers.size})") },
                 )
                 Tab(
                     selected = tabIndex == 1,
                     onClick = { tabIndex = 1 },
-                    text = { Text("سجل الرسائل (${messageLogs.size})") },
+                    text = { Text("السجل (${messageLogs.size})") },
+                )
+                Tab(
+                    selected = tabIndex == 2,
+                    onClick = { tabIndex = 2 },
+                    text = { Text("الواردة (${smsInboxMessages.size})") },
                 )
             }
 
@@ -354,6 +374,29 @@ fun SmsCenterScreen(
                                 Spacer(modifier = Modifier.height(10.dp))
                                 Button(
                                     onClick = {
+                                        viewModel.openSmsIntentForCustomer(
+                                            context = context,
+                                            customer = previewCustomer,
+                                            messageBody = editablePreviewBody,
+                                            templateName = activeTemplate?.name ?: "رسالة مخصصة",
+                                        )
+                                        if (selectedCustomers.size > 1 && previewCustomerIndex < selectedCustomers.size - 1) {
+                                            previewCustomerIndex++
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(50.dp)
+                                        .testTag("open_sms_intent_button"),
+                                ) {
+                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("فتح تطبيق الرسائل (الافتراضي) لـ ${previewCustomer.name}")
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = {
                                         val sendAction = {
                                             viewModel.sendDirectDebtAlertViaSmsManager(
                                                 context = context,
@@ -372,10 +415,9 @@ fun SmsCenterScreen(
                                             smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
                                         }
                                     },
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(50.dp)
+                                        .height(48.dp)
                                         .testTag("send_direct_sms_manager_button"),
                                 ) {
                                     Icon(Icons.Default.Sms, contentDescription = null)
@@ -384,7 +426,7 @@ fun SmsCenterScreen(
                                 }
                                 if (selectedCustomers.size > 1) {
                                     Spacer(modifier = Modifier.height(8.dp))
-                                    Button(
+                                    OutlinedButton(
                                         onClick = {
                                             if (hasSmsPermission) {
                                                 showBulkConfirmDialog = true
@@ -393,7 +435,6 @@ fun SmsCenterScreen(
                                                 smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
                                             }
                                         },
-                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .height(48.dp)
@@ -404,31 +445,9 @@ fun SmsCenterScreen(
                                         Text("إرسال تنبيهات للمحددين (${selectedCustomers.size}) عبر SmsManager")
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedButton(
-                                    onClick = {
-                                        viewModel.openSmsIntentForCustomer(
-                                            context = context,
-                                            customer = previewCustomer,
-                                            messageBody = editablePreviewBody,
-                                            templateName = activeTemplate?.name ?: "رسالة مخصصة",
-                                        )
-                                        if (selectedCustomers.size > 1 && previewCustomerIndex < selectedCustomers.size - 1) {
-                                            previewCustomerIndex++
-                                        }
-                                    },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(48.dp)
-                                        .testTag("open_sms_intent_button"),
-                                ) {
-                                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null)
-                                    Spacer(Modifier.width(8.dp))
-                                    Text("فتح تطبيق الرسائل (SMS Intent) لـ ${previewCustomer.name}")
-                                }
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text(
-                                    "ملاحظة: يتطلب الإرسال المباشر عبر SmsManager صلاحية SEND_SMS، بينما لا يطلب خيار تطبيق الرسائل أي صلاحية.",
+                                    "الافتراضي: فتح تطبيق الرسائل (Intent.ACTION_SENDTO) دون صلاحيات ولا يعتبر الرسالة مرسلة تلقائياً. الإرسال المباشر عبر SmsManager اختياري ويطلب SEND_SMS فقط عند اختياره.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -480,7 +499,7 @@ fun SmsCenterScreen(
                         }
                     }
                 }
-            } else {
+            } else if (tabIndex == 1) {
                 if (messageLogs.isEmpty()) {
                     EmptyStateView(
                         icon = Icons.Default.Sms,
@@ -536,6 +555,84 @@ fun SmsCenterScreen(
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    item {
+                        FinancialCard {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    Icon(Icons.Default.MarkEmailRead, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(8.dp))
+                                    Column {
+                                        Text("قراءة رسائل SMS الواردة (READ_SMS)", fontWeight = FontWeight.Bold)
+                                        Text(
+                                            if (hasReadSmsPermission) "الصلاحية ممنوحة • اضغط تحديث لقراءة صندوق الوارد"
+                                            else "امنح صلاحية قراءة الرسائل لقراءة إشعارات الحوالات الواردة",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                                StatusBadge(
+                                    text = if (hasReadSmsPermission) "مفعّلة" else "مطلوبة",
+                                    color = if (hasReadSmsPermission) financial.success else financial.orange,
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Button(
+                                onClick = {
+                                    if (DirectSmsSender.hasReadSmsPermission(context)) {
+                                        hasReadSmsPermission = true
+                                        viewModel.loadSmsInboxMessages(context)
+                                    } else {
+                                        readSmsPermissionLauncher.launch(Manifest.permission.READ_SMS)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("read_sms_inbox_button"),
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(if (hasReadSmsPermission) "قراءة وتحديث الرسائل الواردة" else "منح صلاحية قراءة SMS وقراءة الوارد")
+                            }
+                        }
+                    }
+                    if (smsInboxMessages.isEmpty()) {
+                        item {
+                            EmptyStateView(
+                                icon = Icons.Default.Sms,
+                                title = "لا توجد رسائل مقروءة بعد",
+                                subtitle = "اضغط على زر قراءة وتحديث الرسائل لعرض آخر الرسائل النصية الواردة.",
+                            )
+                        }
+                    } else {
+                        items(smsInboxMessages, key = { "${it.id}_${it.timestamp}" }) { sms ->
+                            FinancialCard {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                ) {
+                                    Text(sms.address.ifBlank { "مرسل غير معروف" }, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        FormatUtils.formatDateTime(sms.timestamp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(sms.body, style = MaterialTheme.typography.bodyMedium)
                             }
                         }
                     }

@@ -34,18 +34,22 @@ import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Backup
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CurrencyExchange
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Widgets
@@ -112,6 +116,7 @@ fun SettingsScreen(
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val updateState by viewModel.updateState.collectAsStateWithLifecycle()
+    val authorizedFolders by viewModel.authorizedFolders.collectAsStateWithLifecycle()
     val financial = LocalFinancialColors.current
     val context = LocalContext.current
     val biometricAvailability = remember(context) { BiometricAuthHelper.checkAvailability(context) }
@@ -125,8 +130,17 @@ fun SettingsScreen(
     var updateUrlInput by remember(settings.updateManifestUrl) { mutableStateOf(settings.updateManifestUrl) }
     var permissionsRefreshTick by remember { mutableIntStateOf(0) }
 
-    val capabilities = remember(context, settings.workManagerRemindersEnabled, permissionsRefreshTick) {
+    val capabilities = remember(context, settings.workManagerRemindersEnabled, authorizedFolders, permissionsRefreshTick) {
         AppPermissionsManager.getCapabilityStatuses(context, settings.workManagerRemindersEnabled)
+    }
+
+    val storageFolderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.onStorageFolderAuthorized(uri)
+            permissionsRefreshTick++
+        }
     }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -158,6 +172,16 @@ fun SettingsScreen(
         permissionsRefreshTick++
         val grantedCount = results.values.count { it }
         viewModel.emitFeedback("تم منح $grantedCount من أصل ${results.size} صلاحيات مطلوبة")
+    }
+
+    var showErrorLogPreview by remember { mutableStateOf(false) }
+    var errorLogPreviewTick by remember { mutableIntStateOf(0) }
+    val exportErrorLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportErrorLogToUri(uri)
+        }
     }
 
     Scaffold(
@@ -293,7 +317,7 @@ fun SettingsScreen(
                     items(AppThemeMode.entries) { mode ->
                         FilterChip(
                             selected = settings.themeMode == mode,
-                            onClick = { viewModel.updateTheme(mode, settings.colorPalette) },
+                            onClick = { viewModel.updateTheme(themeMode = mode) },
                             label = { Text(mode.titleAr) },
                             modifier = Modifier.testTag("theme_mode_${mode.name}"),
                         )
@@ -307,7 +331,7 @@ fun SettingsScreen(
                     items(AppColorPalette.entries) { pal ->
                         val selected = settings.colorPalette == pal
                         Surface(
-                            onClick = { viewModel.updateTheme(settings.themeMode, pal) },
+                            onClick = { viewModel.updateTheme(palette = pal) },
                             shape = MaterialTheme.shapes.small,
                             color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
                             border = BorderStroke(
@@ -356,11 +380,7 @@ fun SettingsScreen(
                         val swatchColor = if (previewDark) bg.darkPreview else bg.lightPreview
                         Surface(
                             onClick = {
-                                viewModel.updateTheme(
-                                    themeMode = settings.themeMode,
-                                    palette = settings.colorPalette,
-                                    backgroundStyle = bg,
-                                )
+                                viewModel.updateTheme(backgroundStyle = bg)
                             },
                             shape = MaterialTheme.shapes.small,
                             color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
@@ -399,11 +419,7 @@ fun SettingsScreen(
                         val selected = settings.iconShape == shapeOption
                         Surface(
                             onClick = {
-                                viewModel.updateTheme(
-                                    themeMode = settings.themeMode,
-                                    palette = settings.colorPalette,
-                                    iconShape = shapeOption,
-                                )
+                                viewModel.updateTheme(iconShape = shapeOption)
                             },
                             shape = MaterialTheme.shapes.small,
                             color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
@@ -631,7 +647,22 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                        if (cap.isGranted) {
+                        if (cap.kind == AppCapabilityKind.STORAGE_FOLDERS) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                if (cap.isGranted) {
+                                    StatusBadge("${authorizedFolders.size} مجلد", financial.success)
+                                }
+                                OutlinedButton(
+                                    onClick = { storageFolderLauncher.launch(null) },
+                                    modifier = Modifier.testTag("grant_perm_STORAGE_FOLDERS"),
+                                ) {
+                                    Text(if (cap.isGranted) "إضافة" else "منح مجلد")
+                                }
+                            }
+                        } else if (cap.isGranted) {
                             StatusBadge("مفعّل", financial.success)
                         } else if (cap.kind == AppCapabilityKind.REMINDERS) {
                             OutlinedButton(onClick = { viewModel.setWorkManagerReminders(true) }) {
@@ -658,7 +689,81 @@ fun SettingsScreen(
                         }
                     }
                 }
+
+                if (authorizedFolders.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "مجلدات الذاكرة المصرح بالوصول الدائم إليها (${authorizedFolders.size}):",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    authorizedFolders.forEach { folder ->
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        Icons.Default.FolderOpen,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Column {
+                                        Text(folder.displayLabel, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            if (folder.canWrite) "قراءة وحفظ مباشر" else "صلاحية قراءة دائمة",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                                IconButton(
+                                    onClick = {
+                                        viewModel.revokeStorageFolder(folder.treeUri)
+                                        permissionsRefreshTick++
+                                    },
+                                ) {
+                                    Icon(
+                                        Icons.Default.DeleteOutline,
+                                        contentDescription = "إزالة صلاحية المجلد",
+                                        tint = financial.danger,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = { storageFolderLauncher.launch(null) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("grant_storage_folder_button"),
+                ) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("منح وصول لمجلدات ذاكرة الهاتف (التنزيلات / المستندات)")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -797,6 +902,92 @@ fun SettingsScreen(
                         Text(st.message, style = MaterialTheme.typography.bodySmall, color = financial.orange)
                     }
                     AppUpdateState.Idle -> Unit
+                }
+            }
+
+            FinancialCard(modifier = Modifier.testTag("settings_error_log_card")) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(LocalAppIconShape.current)
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Default.BugReport,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("سجل أخطاء الاستيراد والتشخيص (ErrorLogger)", fontWeight = FontWeight.Bold)
+                        Text(
+                            "حفظ استثناءات الاستيراد وLogcat في ملف نصي (.txt) قابل للتصدير",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = { exportErrorLogLauncher.launch("SmartDebt-ErrorLog.txt") },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_export_error_log_button"),
+                    ) {
+                        Icon(Icons.Default.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("تصدير .txt")
+                    }
+                    OutlinedButton(
+                        onClick = { viewModel.shareErrorLog(context) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_share_error_log_button"),
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("مشاركة")
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    TextButton(onClick = {
+                        errorLogPreviewTick++
+                        showErrorLogPreview = !showErrorLogPreview
+                    }) {
+                        Text(if (showErrorLogPreview) "إخفاء المعاينة" else "معاينة السجل المحلي")
+                    }
+                    TextButton(onClick = {
+                        viewModel.clearErrorLogs()
+                        errorLogPreviewTick++
+                    }) {
+                        Text("مسح السجل", color = financial.danger)
+                    }
+                }
+                if (showErrorLogPreview) {
+                    val logText = remember(errorLogPreviewTick) { viewModel.getErrorLogPreviewText() }
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = logText,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
                 }
             }
 

@@ -28,6 +28,15 @@ class AccountingRepository(private val database: SmartDebtDatabase) {
     fun observeCustomerWithBalance(customerId: Long): Flow<CustomerWithBalance?> =
         customerDao.observeCustomerWithBalance(customerId)
 
+    fun observeCustomersWithDebts(): Flow<List<CustomerWithDebts>> =
+        customerDao.observeCustomersWithDebts()
+
+    suspend fun getCustomerWithDebts(customerId: Long): CustomerWithDebts? =
+        customerDao.getCustomerWithDebts(customerId)
+
+    suspend fun getCustomerWithDebtsAndPayments(customerId: Long): CustomerWithDebtsAndPayments? =
+        customerDao.getCustomerWithDebtsAndPayments(customerId)
+
     fun observeAllTransactions(): Flow<List<TransactionWithCustomer>> =
         transactionDao.observeAllTransactions()
 

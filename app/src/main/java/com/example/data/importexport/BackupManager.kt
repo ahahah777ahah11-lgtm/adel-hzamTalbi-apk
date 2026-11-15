@@ -25,6 +25,8 @@ import com.example.ui.theme.AppBackgroundStyle
 import com.example.ui.theme.AppColorPalette
 import com.example.ui.theme.AppIconShape
 import com.example.ui.theme.AppThemeMode
+import com.example.util.AppDiagnosticLogger
+import com.example.util.ErrorLogger
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -63,6 +65,18 @@ data class SqliteBackupValidationResult(
     val fileSizeBytes: Long = 0L,
     val errorMessage: String? = null,
     val tempDbFilePath: String? = null,
+)
+
+data class DatabaseIntegrityReport(
+    val isValid: Boolean,
+    val sqliteHeaderValid: Boolean,
+    val quickCheckPassed: Boolean,
+    val walDetected: Boolean,
+    val shmDetected: Boolean,
+    val walCheckpointed: Boolean,
+    val tablesCount: Int = 0,
+    val errorMessage: String? = null,
+    val warnings: List<String> = emptyList(),
 )
 
 class BackupManager(
@@ -223,7 +237,19 @@ class BackupManager(
     suspend fun createLocalSafetyBackup(context: Context, prefix: String = "pre_import"): File {
         val dir = File(context.filesDir, "backups").apply { mkdirs() }
         val file = File(dir, "SmartDebtManager-${prefix}-${System.currentTimeMillis()}.json")
-        file.writeText(createBackupJsonString(), Charsets.UTF_8)
+        val tmp = File(dir, "${file.name}.tmp")
+        try {
+            tmp.writeText(createBackupJsonString(), Charsets.UTF_8)
+            if (file.exists()) file.delete()
+            if (!tmp.renameTo(file)) {
+                tmp.copyTo(file, overwrite = true)
+            }
+        } catch (t: Throwable) {
+            AppDiagnosticLogger.logError(context, "Backup", "Failed writing local safety backup", t)
+            throw t
+        } finally {
+            runCatching { tmp.delete() }
+        }
         return file
     }
 
@@ -238,23 +264,26 @@ class BackupManager(
     }
 
     suspend fun exportSqliteDatabaseToFile(context: Context, destinationFile: File): Result<File> {
+        val tempWrite = File(destinationFile.parentFile ?: context.cacheDir, "${destinationFile.name}.tmp")
         return runCatching {
             destinationFile.parentFile?.mkdirs()
             // Flush WAL pages to the main .db file before copying
-            runCatching {
-                database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(FULL)").use { it.moveToFirst() }
-            }
+            SmartDebtDatabase.checkpointWal(database)
             val liveDbFile = context.getDatabasePath(SmartDebtDatabase.DB_NAME)
             if (liveDbFile != null && liveDbFile.exists() && liveDbFile.length() > 0L) {
                 liveDbFile.inputStream().use { input ->
-                    destinationFile.outputStream().use { out ->
+                    tempWrite.outputStream().use { out ->
                         input.copyTo(out)
                     }
                 }
-                normalizeWalHeaderFlags(destinationFile)
+                normalizeWalHeaderFlags(tempWrite)
             } else {
                 // Fallback for in-memory database instances (e.g. unit tests)
-                writeStandaloneSqliteSnapshot(destinationFile)
+                writeStandaloneSqliteSnapshot(tempWrite)
+            }
+            if (destinationFile.exists()) destinationFile.delete()
+            if (!tempWrite.renameTo(destinationFile)) {
+                tempWrite.copyTo(destinationFile, overwrite = true)
             }
             database.auditLogDao().insert(
                 AuditLogEntity(
@@ -266,6 +295,10 @@ class BackupManager(
                 )
             )
             destinationFile
+        }.onFailure { err ->
+            AppDiagnosticLogger.logError(context, "Backup", "exportSqliteDatabaseToFile failed", err)
+        }.also {
+            runCatching { tempWrite.delete() }
         }
     }
 
@@ -332,24 +365,196 @@ class BackupManager(
         }
     }
 
-    private fun inspectSqliteBackupFileInternal(tempFile: File, deleteOnInvalid: Boolean): SqliteBackupValidationResult {
-        if (!tempFile.exists() || tempFile.length() < 100L) {
-            if (deleteOnInvalid) tempFile.delete()
-            return SqliteBackupValidationResult(
+    fun validateDatabaseIntegrity(
+        context: Context?,
+        sourceFile: File,
+    ): DatabaseIntegrityReport {
+        if (!sourceFile.exists() || sourceFile.length() < 100L) {
+            val msg = "حجم ملف قاعدة البيانات صغير جداً أو غير موجود."
+            ErrorLogger.logImportException(context, "ValidateDbIntegrity", "$msg (${sourceFile.name})")
+            return DatabaseIntegrityReport(
                 isValid = false,
-                integrityOk = false,
-                errorMessage = "حجم الملف صغير جداً ولا يمثل قاعدة بيانات SQLite صالحة.",
+                sqliteHeaderValid = false,
+                quickCheckPassed = false,
+                walDetected = false,
+                shmDetected = false,
+                walCheckpointed = false,
+                errorMessage = msg,
             )
         }
-        val header = ByteArray(16)
-        tempFile.inputStream().use { it.read(header) }
-        val magic = String(header, Charsets.US_ASCII)
+
+        val header = ByteArray(20)
+        val headerReadCount = runCatching {
+            sourceFile.inputStream().use { it.read(header) }
+        }.getOrElse { err ->
+            val msg = "تعذر قراءة ترويسة ملف SQLite: ${err.message}"
+            ErrorLogger.logImportException(context, "ValidateDbIntegrity", msg, err)
+            return DatabaseIntegrityReport(
+                isValid = false,
+                sqliteHeaderValid = false,
+                quickCheckPassed = false,
+                walDetected = false,
+                shmDetected = false,
+                walCheckpointed = false,
+                errorMessage = msg,
+            )
+        }
+
+        val magic = if (headerReadCount >= 15) String(header, 0, 15, Charsets.US_ASCII) else ""
         if (!magic.startsWith("SQLite format 3")) {
+            val msg = "قاعدة البيانات مشفرة أو بصيغة غير صالحة (ليست SQLite3)."
+            ErrorLogger.logImportException(context, "ValidateDbIntegrity", "$msg (${sourceFile.name})")
+            return DatabaseIntegrityReport(
+                isValid = false,
+                sqliteHeaderValid = false,
+                quickCheckPassed = false,
+                walDetected = false,
+                shmDetected = false,
+                walCheckpointed = false,
+                errorMessage = msg,
+            )
+        }
+
+        val walSidecar = File("${sourceFile.absolutePath}-wal")
+        val shmSidecar = File("${sourceFile.absolutePath}-shm")
+        val isWalHeader = headerReadCount >= 20 && (header[18].toInt() == 2 || header[19].toInt() == 2)
+        val walDetected = isWalHeader || walSidecar.exists()
+        val shmDetected = shmSidecar.exists()
+        val warnings = mutableListOf<String>()
+
+        val tempDir = context?.cacheDir ?: sourceFile.parentFile?.takeIf { it.canWrite() }
+            ?: File(System.getProperty("java.io.tmpdir") ?: ".")
+        val tempDb = File.createTempFile("integrity_chk_", ".db", tempDir)
+        val tempWal = File("${tempDb.absolutePath}-wal")
+        val tempShm = File("${tempDb.absolutePath}-shm")
+        var walCheckpointed = false
+
+        try {
+            sourceFile.inputStream().use { input ->
+                tempDb.outputStream().use { out -> input.copyTo(out) }
+            }
+
+            if (walSidecar.exists() && walSidecar.length() > 0L) {
+                walSidecar.inputStream().use { input ->
+                    tempWal.outputStream().use { out -> input.copyTo(out) }
+                }
+                if (shmSidecar.exists() && shmSidecar.length() > 0L) {
+                    shmSidecar.inputStream().use { input ->
+                        tempShm.outputStream().use { out -> input.copyTo(out) }
+                    }
+                }
+                runCatching {
+                    SQLiteDatabase.openDatabase(
+                        tempDb.absolutePath,
+                        null,
+                        SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
+                    ).use { rwDb ->
+                        rwDb.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { c ->
+                            walCheckpointed = c.moveToFirst()
+                        }
+                    }
+                }.onFailure { err ->
+                    ErrorLogger.logImportWarning(
+                        context,
+                        "ValidateDbIntegrity",
+                        "WAL checkpoint fallback warning for ${sourceFile.name}: ${err.message}",
+                    )
+                    warnings.add("تعذر دمج بعض إطارات WAL الجانبية: ${err.message}")
+                }
+                runCatching { tempWal.delete() }
+                runCatching { tempShm.delete() }
+                if (walCheckpointed) {
+                    warnings.add("تم دمج ومعالجة معاملات WAL/SHM على نسخة فحص مؤقتة بأمان دون تعديل الأصل.")
+                }
+            } else if (isWalHeader) {
+                warnings.add("القاعدة كانت بوضع WAL دون ملف (-wal) مرفق؛ تم فحص النسخة المؤقتة بعد تطبيع الترويسة.")
+            }
+
+            normalizeWalHeaderFlags(tempDb)
+
+            val db = SQLiteDatabase.openDatabase(
+                tempDb.absolutePath,
+                null,
+                SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
+            )
+            return db.use { sqlite ->
+                var quickCheckMsg = ""
+                var quickOk = false
+                sqlite.rawQuery("PRAGMA quick_check", null).use { c ->
+                    if (c.moveToFirst()) {
+                        quickCheckMsg = c.getString(0).orEmpty()
+                        quickOk = quickCheckMsg.equals("ok", ignoreCase = true)
+                    }
+                }
+                var tablesCount = 0
+                if (quickOk) {
+                    sqlite.rawQuery(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                        null,
+                    ).use { tc ->
+                        if (tc.moveToFirst()) tablesCount = tc.getInt(0)
+                    }
+                }
+                if (!quickOk) {
+                    val errMsg = "فشل فحص سلامة SQLite (PRAGMA quick_check): $quickCheckMsg"
+                    ErrorLogger.logImportException(context, "ValidateDbIntegrity", "$errMsg (${sourceFile.name})")
+                    DatabaseIntegrityReport(
+                        isValid = false,
+                        sqliteHeaderValid = true,
+                        quickCheckPassed = false,
+                        walDetected = walDetected,
+                        shmDetected = shmDetected,
+                        walCheckpointed = walCheckpointed,
+                        tablesCount = tablesCount,
+                        errorMessage = errMsg,
+                        warnings = warnings,
+                    )
+                } else {
+                    ErrorLogger.logImportInfo(
+                        context,
+                        "ValidateDbIntegrity",
+                        "Integrity check passed for ${sourceFile.name} (tables=$tablesCount, walDetected=$walDetected, walCheckpointed=$walCheckpointed)",
+                    )
+                    DatabaseIntegrityReport(
+                        isValid = true,
+                        sqliteHeaderValid = true,
+                        quickCheckPassed = true,
+                        walDetected = walDetected,
+                        shmDetected = shmDetected,
+                        walCheckpointed = walCheckpointed,
+                        tablesCount = tablesCount,
+                        warnings = warnings,
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            val errMsg = "فشل فحص سلامة قاعدة البيانات (${sourceFile.name}): ${t.message ?: "ملف تالف أو مشفر"}"
+            ErrorLogger.logImportException(context, "ValidateDbIntegrity", errMsg, t)
+            return DatabaseIntegrityReport(
+                isValid = false,
+                sqliteHeaderValid = true,
+                quickCheckPassed = false,
+                walDetected = walDetected,
+                shmDetected = shmDetected,
+                walCheckpointed = walCheckpointed,
+                errorMessage = errMsg,
+                warnings = warnings,
+            )
+        } finally {
+            runCatching { tempWal.delete() }
+            runCatching { tempShm.delete() }
+            runCatching { tempDb.delete() }
+        }
+    }
+
+    private fun inspectSqliteBackupFileInternal(tempFile: File, deleteOnInvalid: Boolean): SqliteBackupValidationResult {
+        val integrityReport = validateDatabaseIntegrity(context = null, sourceFile = tempFile)
+        if (!integrityReport.isValid) {
             if (deleteOnInvalid) tempFile.delete()
             return SqliteBackupValidationResult(
                 isValid = false,
-                integrityOk = false,
-                errorMessage = "الملف المختار ليس بصيغة SQLite3 صالحة.",
+                integrityOk = integrityReport.quickCheckPassed,
+                errorMessage = integrityReport.errorMessage ?: "فشل فحص سلامة قاعدة البيانات.",
             )
         }
         normalizeWalHeaderFlags(tempFile)
@@ -361,12 +566,6 @@ class BackupManager(
                 SQLiteDatabase.OPEN_READONLY or SQLiteDatabase.NO_LOCALIZED_COLLATORS,
             )
             db.use { sqlite ->
-                var integrityOk = false
-                sqlite.rawQuery("PRAGMA quick_check", null).use { c ->
-                    if (c.moveToFirst()) {
-                        integrityOk = c.getString(0).equals("ok", ignoreCase = true)
-                    }
-                }
                 val tables = mutableSetOf<String>()
                 sqlite.rawQuery("SELECT name FROM sqlite_master WHERE type='table'", null).use { c ->
                     while (c.moveToNext()) tables.add(c.getString(0).lowercase())
@@ -375,7 +574,7 @@ class BackupManager(
                     if (deleteOnInvalid) tempFile.delete()
                     return SqliteBackupValidationResult(
                         isValid = false,
-                        integrityOk = integrityOk,
+                        integrityOk = true,
                         errorMessage = "الملف لا يحتوي على جداول تطبيق مدير الديون الذكي (customers / transactions). يمكنك استخدام شاشة استيراد البيانات لاستيراد قواعد التطبيقات الأخرى.",
                     )
                 }
@@ -386,19 +585,20 @@ class BackupManager(
                     }
                 }
                 SqliteBackupValidationResult(
-                    isValid = integrityOk,
-                    integrityOk = integrityOk,
+                    isValid = true,
+                    integrityOk = true,
                     customersCount = countTable("customers"),
                     transactionsCount = countTable("transactions"),
                     remindersCount = countTable("reminders"),
                     transfersCount = countTable("transfers"),
                     messageLogsCount = countTable("message_logs"),
                     fileSizeBytes = tempFile.length(),
-                    errorMessage = if (integrityOk) null else "فشل فحص سلامة قاعدة البيانات (PRAGMA quick_check).",
-                    tempDbFilePath = if (integrityOk) tempFile.absolutePath else null,
+                    errorMessage = null,
+                    tempDbFilePath = tempFile.absolutePath,
                 )
             }
         } catch (t: Throwable) {
+            ErrorLogger.logImportException(null, "InspectSqliteBackup", "Failed opening backup copy", t)
             if (deleteOnInvalid) runCatching { tempFile.delete() }
             SqliteBackupValidationResult(
                 isValid = false,
@@ -1036,24 +1236,39 @@ class BackupManager(
         }
     }
 
-    suspend fun restoreFromValidatedBackup(validation: BackupValidationResult): Result<String> {
+    suspend fun restoreFromValidatedBackup(
+        validation: BackupValidationResult,
+        context: Context? = null,
+    ): Result<String> {
         val data = validation.data
         if (!validation.isValid || data == null) {
             return Result.failure(IllegalArgumentException(validation.errorMessage ?: "النسخة غير صالحة"))
         }
 
-        database.withTransaction {
-            database.reminderDao().deleteAll()
-            database.debtsDao().deleteAll()
-            database.paymentsDao().deleteAll()
-            database.transactionDao().deleteAll()
-            database.transferDao().deleteAll()
-            database.messageLogDao().deleteAll()
-            database.smsTemplateDao().deleteAll()
-            database.auditLogDao().deleteAll()
-            database.customerDao().deleteAll()
+        val existingCustomersCount = database.customerDao().getAllCustomersOnce().size
+        if (data.customers.isEmpty() && existingCustomersCount > 0) {
+            AppDiagnosticLogger.logWarn(context, "Backup", "Blocked empty JSON backup restore over $existingCustomersCount existing customers")
+            return Result.failure(
+                IllegalStateException("ملف النسخة الاحتياطية لا يحتوي على عملاء؛ تم إيقاف الاستعادة لحماية بيانات العملاء الحالية.")
+            )
+        }
 
-            data.customers.forEach { database.customerDao().insert(it) }
+        return try {
+            if (context != null) {
+                createLocalSafetyBackup(context, "pre_json_restore")
+            }
+            database.withTransaction {
+                database.reminderDao().deleteAll()
+                database.debtsDao().deleteAll()
+                database.paymentsDao().deleteAll()
+                database.transactionDao().deleteAll()
+                database.transferDao().deleteAll()
+                database.messageLogDao().deleteAll()
+                database.smsTemplateDao().deleteAll()
+                database.auditLogDao().deleteAll()
+                database.customerDao().deleteAll()
+
+                data.customers.forEach { database.customerDao().insert(it) }
             data.transactions.forEach { tx ->
                 database.transactionDao().insert(tx)
                 if (tx.type.isDebit) {
@@ -1104,8 +1319,13 @@ class BackupManager(
             )
         }
 
-        data.settings?.let { settingsDataStore.applyRestoredSettings(it) }
-        return Result.success("تمت استعادة النسخة الاحتياطية بنجاح (${data.customers.size} عميل، ${data.transactions.size} عملية).")
+            data.settings?.let { settingsDataStore.applyRestoredSettings(it) }
+            AppDiagnosticLogger.logInfo(context, "Backup", "JSON backup restored: ${data.customers.size} customers, ${data.transactions.size} txs")
+            Result.success("تمت استعادة النسخة الاحتياطية بنجاح (${data.customers.size} عميل، ${data.transactions.size} عملية).")
+        } catch (t: Throwable) {
+            AppDiagnosticLogger.logError(context, "Backup", "JSON backup restore failed", t)
+            Result.failure(t)
+        }
     }
 
     private fun sha256(input: String): String {

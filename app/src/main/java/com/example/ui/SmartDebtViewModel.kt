@@ -28,6 +28,7 @@ import com.example.data.local.AccountingRepository
 import com.example.data.local.AccountingResult
 import com.example.data.local.AuditLogEntity
 import com.example.data.local.CustomerWithBalance
+import com.example.data.local.CustomerWithDebts
 import com.example.data.local.DashboardSummary
 import com.example.data.local.MessageLogEntity
 import com.example.data.local.MessageStatus
@@ -43,14 +44,19 @@ import com.example.data.preferences.AppSettings
 import com.example.data.preferences.SettingsDataStore
 import com.example.data.sms.DirectSmsSender
 import com.example.data.sms.SmsDispatchResult
+import com.example.data.sms.SmsInboxMessage
 import com.example.data.sms.SmsTemplateEngine
 import com.example.data.update.AppUpdateChecker
 import com.example.data.update.AppUpdateState
+import com.example.security.AppPermissionsManager
+import com.example.security.AuthorizedStorageFolder
+import com.example.security.StorageTreeFileEntry
 import com.example.ui.theme.AppBackgroundStyle
 import com.example.ui.theme.AppColorPalette
 import com.example.ui.theme.AppIconShape
 import com.example.ui.theme.AppThemeMode
 import com.example.util.BalanceShareHelper
+import com.example.util.ErrorLogger
 import com.example.worker.OverdueReminderWorker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -98,6 +104,9 @@ class SmartDebtViewModel(
     val customers: StateFlow<List<CustomerWithBalance>> = repository.observeCustomersWithBalance()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val customersWithDebts: StateFlow<List<CustomerWithDebts>> = repository.observeCustomersWithDebts()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     val transactions: StateFlow<List<TransactionWithCustomer>> = repository.observeAllTransactions()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -129,6 +138,9 @@ class SmartDebtViewModel(
     private val _importBusy = MutableStateFlow(false)
     val importBusy: StateFlow<Boolean> = _importBusy.asStateFlow()
 
+    private val _importError = MutableStateFlow<String?>(null)
+    val importError: StateFlow<String?> = _importError.asStateFlow()
+
     // Backup State
     private val _backupValidation = MutableStateFlow<BackupValidationResult?>(null)
     val backupValidation: StateFlow<BackupValidationResult?> = _backupValidation.asStateFlow()
@@ -138,6 +150,20 @@ class SmartDebtViewModel(
 
     private val _localBackups = MutableStateFlow<List<File>>(emptyList())
     val localBackups: StateFlow<List<File>> = _localBackups.asStateFlow()
+
+    // Persistent Storage Folder Access (SAF OpenDocumentTree)
+    private val _authorizedFolders = MutableStateFlow<List<AuthorizedStorageFolder>>(emptyList())
+    val authorizedFolders: StateFlow<List<AuthorizedStorageFolder>> = _authorizedFolders.asStateFlow()
+
+    private val _discoveredFolderFiles = MutableStateFlow<List<StorageTreeFileEntry>>(emptyList())
+    val discoveredFolderFiles: StateFlow<List<StorageTreeFileEntry>> = _discoveredFolderFiles.asStateFlow()
+
+    private val _folderScanBusy = MutableStateFlow(false)
+    val folderScanBusy: StateFlow<Boolean> = _folderScanBusy.asStateFlow()
+
+    // SMS Inbox Reader State (READ_SMS)
+    private val _smsInboxMessages = MutableStateFlow<List<SmsInboxMessage>>(emptyList())
+    val smsInboxMessages: StateFlow<List<SmsInboxMessage>> = _smsInboxMessages.asStateFlow()
 
     // Biometric App Lock State (starts locked; only enforced when settings.biometricLockEnabled == true)
     private val _isSessionUnlocked = MutableStateFlow(false)
@@ -166,6 +192,7 @@ class SmartDebtViewModel(
         viewModelScope.launch(Dispatchers.IO + safeHandler) {
             runCatching { repository.refreshOverdueStatuses() }
             runCatching { refreshLocalBackups() }
+            runCatching { refreshAuthorizedStorageFoldersInternal() }
             runCatching {
                 val cfg = settingsDataStore.getSettingsOnce()
                 if (cfg.autoUpdateCheckEnabled && cfg.updateManifestUrl.isNotBlank()) {
@@ -320,6 +347,75 @@ class SmartDebtViewModel(
             emitFeedback("تم فتح واجهة الطباعة لنظام أندرويد")
         } else {
             emitFeedback("خدمة الطباعة غير متوفرة على هذا الجهاز.", isError = true)
+        }
+    }
+
+    // Account Statement Print & PDF actions
+    fun printCustomerStatement(
+        context: Context,
+        customer: CustomerWithBalance,
+        txs: List<TransactionWithCustomer>,
+    ) {
+        val launched = PaymentReceiptPdfGenerator.printCustomerStatement(context, customer, txs, settings.value)
+        if (launched) {
+            emitFeedback("تم تجهيز كشف حساب (${customer.name}) للطباعة عبر نظام أندرويد")
+        } else {
+            emitFeedback("خدمة الطباعة غير متوفرة على هذا الجهاز.", isError = true)
+        }
+    }
+
+    fun printPortfolioStatement(context: Context) {
+        val activeCustomers = customers.value
+        val launched = PaymentReceiptPdfGenerator.printPortfolioStatement(context, activeCustomers, settings.value)
+        if (launched) {
+            emitFeedback("تم تجهيز كشف الديون الشامل للطباعة (${activeCustomers.size} عميل)")
+        } else {
+            emitFeedback("خدمة الطباعة غير متوفرة على هذا الجهاز.", isError = true)
+        }
+    }
+
+    fun shareCustomerStatementPdf(
+        context: Context,
+        customer: CustomerWithBalance,
+        txs: List<TransactionWithCustomer>,
+    ) {
+        viewModelScope.launch {
+            val curSettings = settings.value
+            val fileRes = withContext(Dispatchers.IO) {
+                PaymentReceiptPdfGenerator.createTempStatementFile(context, customer, txs, curSettings)
+            }
+            fileRes.onSuccess { file ->
+                val shared = PaymentReceiptPdfGenerator.shareCustomerStatementPdf(context, file, customer.name)
+                if (shared) {
+                    emitFeedback("تم تجهيز كشف حساب PDF للمشاركة (${customer.name})")
+                } else {
+                    emitFeedback("تعذر فتح نافذة المشاركة على هذا الجهاز.", isError = true)
+                }
+            }.onFailure { err ->
+                emitFeedback("فشل إنشاء كشف حساب PDF: ${err.message}", isError = true)
+            }
+        }
+    }
+
+    fun saveCustomerStatementPdfToUri(
+        uri: Uri,
+        customer: CustomerWithBalance,
+        txs: List<TransactionWithCustomer>,
+    ) {
+        viewModelScope.launch {
+            val curSettings = settings.value
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    getApplication<Application>().contentResolver.openOutputStream(uri)?.use { out ->
+                        PaymentReceiptPdfGenerator.writeCustomerStatementPdf(customer, txs, curSettings, out).getOrThrow()
+                    } ?: error("تعذر فتح مسار حفظ ملف كشف الحساب PDF")
+                }
+            }
+            res.onSuccess {
+                emitFeedback("تم حفظ كشف حساب ${customer.name} بصيغة PDF بنجاح")
+            }.onFailure { err ->
+                emitFeedback("فشل حفظ كشف الحساب PDF: ${err.message}", isError = true)
+            }
         }
     }
 
@@ -614,24 +710,49 @@ class SmartDebtViewModel(
         }
     }
 
-    // Import workflow (crash-hardened with CancellationException preservation & finally cleanup)
+    fun loadSmsInboxMessages(context: Context = getApplication()) {
+        viewModelScope.launch(safeHandler) {
+            if (!DirectSmsSender.hasReadSmsPermission(context)) {
+                emitFeedback("يرجى منح صلاحية قراءة الرسائل (READ_SMS) أولاً.", isError = true)
+                return@launch
+            }
+            val messages = withContext(Dispatchers.IO) {
+                DirectSmsSender.readRecentInboxMessages(context, limit = 30)
+            }
+            _smsInboxMessages.value = messages
+            emitFeedback("تمت قراءة ${messages.size} رسالة SMS من صندوق الوارد")
+        }
+    }
+
+    // Import workflow (crash-hardened, clears previous state on new file selection, AI column analysis, ErrorLogger)
     fun inspectImportUri(uri: Uri) {
         viewModelScope.launch(safeHandler) {
+            // Immediately clear previous inspection/report/error state when importing a new file
             _importBusy.value = true
+            _importInspection.value = null
             _importReport.value = null
+            _importError.value = null
             try {
                 val res = withContext(Dispatchers.IO) {
+                    AppPermissionsManager.takePersistableReadPermission(getApplication(), uri)
                     inspector.inspectUri(getApplication(), uri)
                 }
                 res.onSuccess {
                     _importInspection.value = it
+                    _importError.value = null
                     emitFeedback("تم فحص الملف بنجاح: ${it.previewRows.size} سجل مكتشف")
                 }.onFailure { err ->
-                    emitFeedback(err.message ?: "فشل قراءة الملف", isError = true)
+                    val errMsg = err.message ?: "فشل قراءة الملف"
+                    ErrorLogger.logImportException(getApplication(), "InspectImportUri", errMsg, err)
+                    _importError.value = errMsg
+                    emitFeedback(errMsg, isError = true)
                 }
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                emitFeedback("تعذر معالجة الملف: ${t.message ?: "ملف غير صالح"}", isError = true)
+                val errMsg = "تعذر معالجة الملف: ${t.message ?: "ملف غير صالح"}"
+                ErrorLogger.logImportException(getApplication(), "InspectImportUri", errMsg, t)
+                _importError.value = errMsg
+                emitFeedback(errMsg, isError = true)
             } finally {
                 _importBusy.value = false
             }
@@ -644,11 +765,13 @@ class SmartDebtViewModel(
             _importBusy.value = true
             try {
                 val updated = withContext(Dispatchers.IO) {
-                    inspector.rebuildPreview(current, tableName, mapping)
+                    inspector.rebuildPreview(current, tableName, mapping, current.replaceExistingMode)
                 }
                 _importInspection.value = updated
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
+                ErrorLogger.logImportException(getApplication(), "UpdateImportMapping", "Failed updating column mapping", t)
+                _importError.value = "تعذر تحديث معاينة الأعمدة: ${t.message}"
                 emitFeedback("تعذر تحديث معاينة الأعمدة: ${t.message}", isError = true)
             } finally {
                 _importBusy.value = false
@@ -656,21 +779,73 @@ class SmartDebtViewModel(
         }
     }
 
-    fun confirmAndExecuteImport(createSafetyBackup: Boolean) {
+    fun setReplacePreviousOnImport(replace: Boolean) {
         val current = _importInspection.value ?: return
         viewModelScope.launch(safeHandler) {
             _importBusy.value = true
             try {
+                val updated = withContext(Dispatchers.IO) {
+                    inspector.rebuildPreview(current, current.selectedTableName, current.mapping, replace)
+                }
+                _importInspection.value = updated
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                ErrorLogger.logImportException(getApplication(), "SetReplaceImportMode", "Failed toggling replace mode", t)
+            } finally {
+                _importBusy.value = false
+            }
+        }
+    }
+
+    fun reanalyzeImportColumnsWithAi() {
+        val current = _importInspection.value ?: return
+        viewModelScope.launch(safeHandler) {
+            _importBusy.value = true
+            try {
+                val updated = withContext(Dispatchers.IO) {
+                    inspector.runAiReanalysis(current)
+                }
+                _importInspection.value = updated
+                val conf = updated.aiAnalysis?.confidenceScore ?: 0
+                emitFeedback("تمت إعادة تحليل الأعمدة والمحتوى بالذكاء الاصطناعي (ثقة $conf%)")
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                ErrorLogger.logImportException(getApplication(), "AiReanalyze", "AI column analysis failed", t)
+                emitFeedback("تعذر التحليل الذكي للأعمدة: ${t.message}", isError = true)
+            } finally {
+                _importBusy.value = false
+            }
+        }
+    }
+
+    fun confirmAndExecuteImport(
+        createSafetyBackup: Boolean,
+        replacePreviousData: Boolean = _importInspection.value?.replaceExistingMode ?: false,
+    ) {
+        val current = _importInspection.value ?: return
+        viewModelScope.launch(safeHandler) {
+            _importBusy.value = true
+            _importError.value = null
+            try {
                 val report = withContext(Dispatchers.IO) {
-                    inspector.executeImport(getApplication(), current, createSafetyBackup)
+                    inspector.executeImport(
+                        context = getApplication(),
+                        inspection = current,
+                        createSafetyBackup = createSafetyBackup || replacePreviousData,
+                        replacePreviousData = replacePreviousData,
+                    )
                 }
                 _importReport.value = report
                 _importInspection.value = null
                 refreshLocalBackups()
-                emitFeedback("اكتمل الاستيراد: ${report.importedCustomersCount} عميل، ${report.importedTransactionsCount} عملية")
+                val actionLabel = if (report.replacedPreviousData) "استبدال البيانات واستيراد" else "استيراد"
+                emitFeedback("اكتمل $actionLabel: ${report.importedCustomersCount} عميل، ${report.importedTransactionsCount} عملية")
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
-                emitFeedback("فشل تنفيذ الاستيراد بأمان دون تعديل قاعدة البيانات: ${t.message}", isError = true)
+                val errMsg = "فشل تنفيذ الاستيراد بأمان دون تعديل قاعدة البيانات: ${t.message}"
+                ErrorLogger.logImportException(getApplication(), "ConfirmImport", errMsg, t)
+                _importError.value = errMsg
+                emitFeedback(errMsg, isError = true)
             } finally {
                 _importBusy.value = false
             }
@@ -680,6 +855,169 @@ class SmartDebtViewModel(
     fun clearImportState() {
         _importInspection.value = null
         _importReport.value = null
+        _importError.value = null
+    }
+
+    // ErrorLogger export & management
+    fun exportErrorLogToUri(uri: Uri) {
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                ErrorLogger.exportErrorLogToUri(getApplication(), uri)
+            }
+            res.onSuccess { lines ->
+                emitFeedback("تم تصدير ملف سجل الأخطاء (.txt) بنجاح ($lines سطر)")
+            }.onFailure { err ->
+                emitFeedback("فشل تصدير سجل الأخطاء: ${err.message}", isError = true)
+            }
+        }
+    }
+
+    fun shareErrorLog(context: Context) {
+        val shared = ErrorLogger.shareErrorLog(context)
+        if (shared) {
+            emitFeedback("تم تجهيز ملف سجل الأخطاء (.txt) للمشاركة")
+        } else {
+            emitFeedback("تعذر مشاركة ملف سجل الأخطاء.", isError = true)
+        }
+    }
+
+    fun getErrorLogPreviewText(): String = ErrorLogger.readLogText(getApplication())
+
+    fun clearErrorLogs() {
+        val cleared = ErrorLogger.clearErrorLogs(getApplication())
+        _importError.value = null
+        if (cleared) {
+            emitFeedback("تم مسح سجل الأخطاء المحلي")
+        }
+    }
+
+    // Persistent Storage Folder (SAF OpenDocumentTree) workflow
+    private fun refreshAuthorizedStorageFoldersInternal() {
+        _authorizedFolders.value = AppPermissionsManager.getPersistedStorageFolders(getApplication())
+    }
+
+    fun refreshAuthorizedStorageFolders() {
+        viewModelScope.launch(Dispatchers.IO + safeHandler) {
+            refreshAuthorizedStorageFoldersInternal()
+        }
+    }
+
+    fun onStorageFolderAuthorized(treeUri: Uri) {
+        viewModelScope.launch(safeHandler) {
+            _folderScanBusy.value = true
+            try {
+                val label = AppPermissionsManager.formatTreeFolderLabel(treeUri)
+                val persisted = withContext(Dispatchers.IO) {
+                    AppPermissionsManager.takePersistableTreePermission(getApplication(), treeUri)
+                }
+                withContext(Dispatchers.IO) {
+                    refreshAuthorizedStorageFoldersInternal()
+                    val scanned = AppPermissionsManager.scanStorageTreeFiles(getApplication(), treeUri)
+                    val merged = (scanned + _discoveredFolderFiles.value)
+                        .distinctBy { it.documentUri.toString() }
+                        .sortedByDescending { it.lastModified }
+                    _discoveredFolderFiles.value = merged
+                }
+                if (persisted) {
+                    emitFeedback("تم منح صلاحية الوصول لمجلد ($label) بنجاح")
+                } else {
+                    emitFeedback("تمت قراءة المجلد ($label) مؤقتاً؛ قد يقيد النظام الحفظ الدائم لهذا المسار.")
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                ErrorLogger.logImportException(getApplication(), "AuthorizeFolder", "Failed authorizing storage tree", t)
+                emitFeedback("تعذر ربط المجلد المحدد: ${t.message}", isError = true)
+            } finally {
+                _folderScanBusy.value = false
+            }
+        }
+    }
+
+    fun revokeStorageFolder(treeUri: Uri) {
+        viewModelScope.launch(safeHandler) {
+            withContext(Dispatchers.IO) {
+                AppPermissionsManager.releasePersistableTreePermission(getApplication(), treeUri)
+                refreshAuthorizedStorageFoldersInternal()
+            }
+            scanAuthorizedFolders()
+            emitFeedback("تمت إزالة صلاحية الوصول للمجلد")
+        }
+    }
+
+    fun scanAuthorizedFolders() {
+        viewModelScope.launch(safeHandler) {
+            _folderScanBusy.value = true
+            try {
+                val files = withContext(Dispatchers.IO) {
+                    refreshAuthorizedStorageFoldersInternal()
+                    _authorizedFolders.value
+                        .flatMap { folder -> AppPermissionsManager.scanStorageTreeFiles(getApplication(), folder.treeUri) }
+                        .distinctBy { it.documentUri.toString() }
+                        .sortedByDescending { it.lastModified }
+                }
+                _discoveredFolderFiles.value = files
+                if (_authorizedFolders.value.isNotEmpty()) {
+                    emitFeedback("تم فحص المجلدات المصرح بها: ${files.size} ملف قابل للاستيراد")
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                ErrorLogger.logImportException(getApplication(), "ScanAuthorizedFolders", "Folder scan error", t)
+                emitFeedback("تعذر فحص ملفات المجلد: ${t.message}", isError = true)
+            } finally {
+                _folderScanBusy.value = false
+            }
+        }
+    }
+
+    fun saveBackupToAuthorizedFolder(treeUri: Uri) {
+        viewModelScope.launch(safeHandler) {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val json = backupManager.createBackupJsonString()
+                    AppPermissionsManager.writeDocumentInAuthorizedFolder(
+                        context = getApplication(),
+                        treeUri = treeUri,
+                        fileName = BackupManager.BACKUP_FILENAME,
+                        mimeType = "application/json",
+                    ) { out ->
+                        out.write(json.toByteArray(Charsets.UTF_8))
+                    }.getOrThrow()
+                }
+            }
+            res.onSuccess {
+                emitFeedback("تم حفظ النسخة الاحتياطية مباشرة داخل مجلد الذاكرة المصرح به")
+            }.onFailure { err ->
+                emitFeedback("تعذر الحفظ داخل المجلد: ${err.message}", isError = true)
+            }
+        }
+    }
+
+    fun saveSqliteToAuthorizedFolder(treeUri: Uri) {
+        viewModelScope.launch(safeHandler) {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val tempFile = File.createTempFile("folder_sqlite_", ".db", getApplication<Application>().cacheDir)
+                    try {
+                        backupManager.exportSqliteDatabaseToFile(getApplication(), tempFile).getOrThrow()
+                        AppPermissionsManager.writeDocumentInAuthorizedFolder(
+                            context = getApplication(),
+                            treeUri = treeUri,
+                            fileName = BackupManager.SQLITE_BACKUP_FILENAME,
+                            mimeType = "application/octet-stream",
+                        ) { out ->
+                            tempFile.inputStream().use { input -> input.copyTo(out) }
+                        }.getOrThrow()
+                    } finally {
+                        tempFile.delete()
+                    }
+                }
+            }
+            res.onSuccess {
+                emitFeedback("تم حفظ قاعدة بيانات SQLite مباشرة داخل مجلد الذاكرة المصرح به")
+            }.onFailure { err ->
+                emitFeedback("تعذر حفظ SQLite داخل المجلد: ${err.message}", isError = true)
+            }
+        }
     }
 
     // Export workflow
@@ -784,7 +1122,7 @@ class SmartDebtViewModel(
         val current = _backupValidation.value ?: return
         viewModelScope.launch {
             val res = withContext(Dispatchers.IO) {
-                backupManager.restoreFromValidatedBackup(current)
+                backupManager.restoreFromValidatedBackup(current, getApplication())
             }
             res.onSuccess { msg ->
                 _backupValidation.value = null
@@ -885,10 +1223,10 @@ class SmartDebtViewModel(
     }
 
     fun updateTheme(
-        themeMode: AppThemeMode,
-        palette: AppColorPalette,
-        backgroundStyle: AppBackgroundStyle = settings.value.backgroundStyle,
-        iconShape: AppIconShape = settings.value.iconShape,
+        themeMode: AppThemeMode? = null,
+        palette: AppColorPalette? = null,
+        backgroundStyle: AppBackgroundStyle? = null,
+        iconShape: AppIconShape? = null,
     ) {
         viewModelScope.launch {
             settingsDataStore.updateTheme(

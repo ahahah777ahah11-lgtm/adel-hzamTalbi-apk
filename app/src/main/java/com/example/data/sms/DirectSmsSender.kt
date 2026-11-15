@@ -6,9 +6,17 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Telephony
 import android.telephony.SmsManager
 import androidx.core.content.ContextCompat
 import com.example.util.FormatUtils
+
+data class SmsInboxMessage(
+    val id: Long,
+    val address: String,
+    val body: String,
+    val timestamp: Long,
+)
 
 sealed class SmsDispatchResult {
     data class Dispatched(val partsCount: Int, val normalizedPhone: String) : SmsDispatchResult()
@@ -63,6 +71,53 @@ object DirectSmsSender {
             context,
             Manifest.permission.SEND_SMS,
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun hasReadSmsPermission(context: Context): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_SMS,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun readRecentInboxMessages(context: Context, limit: Int = 30): List<SmsInboxMessage> {
+        if (!hasReadSmsPermission(context)) return emptyList()
+        val results = mutableListOf<SmsInboxMessage>()
+        val projection = arrayOf(
+            Telephony.Sms._ID,
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE,
+        )
+        runCatching {
+            context.contentResolver.query(
+                Telephony.Sms.Inbox.CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${Telephony.Sms.DATE} DESC",
+            )?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(Telephony.Sms._ID)
+                val addrIdx = cursor.getColumnIndex(Telephony.Sms.ADDRESS)
+                val bodyIdx = cursor.getColumnIndex(Telephony.Sms.BODY)
+                val dateIdx = cursor.getColumnIndex(Telephony.Sms.DATE)
+                while (cursor.moveToNext() && results.size < limit) {
+                    val id = if (idIdx >= 0) cursor.getLong(idIdx) else results.size.toLong()
+                    val addr = if (addrIdx >= 0) cursor.getString(addrIdx).orEmpty().trim() else ""
+                    val body = if (bodyIdx >= 0) cursor.getString(bodyIdx).orEmpty().trim() else ""
+                    val date = if (dateIdx >= 0) cursor.getLong(dateIdx) else 0L
+                    if (body.isNotBlank()) {
+                        results += SmsInboxMessage(
+                            id = id,
+                            address = addr,
+                            body = body,
+                            timestamp = date,
+                        )
+                    }
+                }
+            }
+        }
+        return results
     }
 
     fun resolveSmsManager(context: Context): SmsManager? {

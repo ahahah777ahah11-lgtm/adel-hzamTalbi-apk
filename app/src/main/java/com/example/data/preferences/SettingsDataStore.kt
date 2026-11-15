@@ -87,14 +87,18 @@ class SettingsDataStore(private val context: Context) {
     }
 
     suspend fun updateTheme(
-        themeMode: AppThemeMode,
-        colorPalette: AppColorPalette,
+        themeMode: AppThemeMode? = null,
+        colorPalette: AppColorPalette? = null,
         backgroundStyle: AppBackgroundStyle? = null,
         iconShape: AppIconShape? = null,
     ) {
         context.dataStore.edit { prefs ->
-            prefs[Keys.THEME_MODE] = themeMode.name
-            prefs[Keys.COLOR_PALETTE] = colorPalette.name
+            if (themeMode != null) {
+                prefs[Keys.THEME_MODE] = themeMode.name
+            }
+            if (colorPalette != null) {
+                prefs[Keys.COLOR_PALETTE] = colorPalette.name
+            }
             if (backgroundStyle != null) {
                 prefs[Keys.BACKGROUND_STYLE] = backgroundStyle.name
             }

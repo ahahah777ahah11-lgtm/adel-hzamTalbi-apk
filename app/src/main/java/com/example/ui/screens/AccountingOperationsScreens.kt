@@ -32,8 +32,10 @@ import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -120,6 +122,14 @@ fun AccountStatementScreen(
             viewModel.exportCustomerStatementToUri(c, transactions, ExportFormat.XLSX, uri)
         }
     }
+    val exportPdfLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/pdf")
+    ) { uri ->
+        val c = customer
+        if (uri != null && c != null) {
+            viewModel.saveCustomerStatementPdfToUri(uri, c, transactions)
+        }
+    }
 
     val ledgerRows = remember(transactions, includeReversed) {
         var running = 0.0
@@ -138,6 +148,14 @@ fun AccountStatementScreen(
                 subtitle = customer?.accountNumber,
                 onBack = onBack,
                 actions = {
+                    customer?.let { c ->
+                        IconButton(
+                            onClick = { viewModel.printCustomerStatement(context, c, transactions) },
+                            modifier = Modifier.testTag("topbar_print_statement_button"),
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = "طباعة كشف الحساب")
+                        }
+                    }
                     IconButton(onClick = {
                         exportXlsxLauncher.launch("Statement_${customer?.name ?: customerId}.xlsx")
                     }) {
@@ -173,6 +191,42 @@ fun AccountStatementScreen(
                         }
                     }
                     Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Button(
+                            onClick = { viewModel.printCustomerStatement(context, c, transactions) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("print_statement_button"),
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("طباعة الكشف")
+                        }
+                        OutlinedButton(
+                            onClick = { exportPdfLauncher.launch("Statement_${c.name}.pdf") },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("save_statement_pdf_button"),
+                        ) {
+                            Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("حفظ PDF")
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.shareCustomerStatementPdf(context, c, transactions) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("share_statement_pdf_button"),
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("مشاركة")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -302,6 +356,7 @@ fun AddDebtScreen(
     var isOpeningBalance by remember { mutableStateOf(false) }
     var amountText by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
+    var referenceNumber by remember { mutableStateOf("") }
     var attachedPhotoPath by remember { mutableStateOf<String?>(null) }
     var attachedLocationTag by remember { mutableStateOf<String?>(null) }
 
@@ -421,6 +476,16 @@ fun AddDebtScreen(
                         .fillMaxWidth()
                         .testTag("debt_description_input"),
                 )
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = referenceNumber,
+                    onValueChange = { referenceNumber = it },
+                    label = { Text("رقم الفاتورة / المرجع المحاسبي (اختياري)") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("debt_reference_input"),
+                )
 
                 Spacer(modifier = Modifier.height(10.dp))
                 Text("مرفقات اختيارية (كاميرا / ملف / موقع):", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
@@ -510,6 +575,15 @@ fun AddDebtScreen(
                                 fontWeight = FontWeight.Bold,
                                 color = financial.danger,
                             )
+                            if (cust.creditLimit > 0.0 && (cust.balance + parsed) > cust.creditLimit) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "تنبيه محاسبي: الرصيد الجديد سيتجاوز الحد الائتماني المحدد (${FormatUtils.formatAmount(cust.creditLimit, cur)})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = financial.orange,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
                         }
                     }
                 }
@@ -535,6 +609,7 @@ fun AddDebtScreen(
                             amount = amount,
                             description = fullDesc,
                             dateMillis = System.currentTimeMillis(),
+                            referenceNumber = referenceNumber.takeIf { it.isNotBlank() },
                             onSuccess = onSaved,
                         )
                     },
@@ -571,6 +646,7 @@ fun AddPaymentScreen(
     var isSettlement by remember { mutableStateOf(false) }
     var amountText by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
+    var referenceNumber by remember { mutableStateOf("") }
     var createdReceiptPair by remember { mutableStateOf<Pair<TransactionWithCustomer, CustomerWithBalance>?>(null) }
 
     LaunchedEffect(customers, preselectedCustomerId) {
@@ -650,6 +726,16 @@ fun AddPaymentScreen(
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = referenceNumber,
+                    onValueChange = { referenceNumber = it },
+                    label = { Text("رقم سند القبض / المرجع (اختياري)") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("payment_reference_input"),
+                )
 
                 if (!settings.allowOverpayment) {
                     Spacer(modifier = Modifier.height(8.dp))
@@ -675,6 +761,7 @@ fun AddPaymentScreen(
                         val amount = FormatUtils.parsePositiveAmount(amountText) ?: 0.0
                         val txType = if (isSettlement) TransactionType.SETTLEMENT else TransactionType.PAYMENT
                         val desc = description.ifBlank { if (isSettlement) "تسوية حساب" else "دفعة سداد" }
+                        val refNo = referenceNumber.trim().takeIf { it.isNotBlank() }
                         val now = System.currentTimeMillis()
                         viewModel.recordTransactionWithId(
                             customerId = target.id,
@@ -682,6 +769,7 @@ fun AddPaymentScreen(
                             amount = amount,
                             description = desc,
                             dateMillis = now,
+                            referenceNumber = refNo,
                             onSuccess = { txId ->
                                 val receiptTx = TransactionWithCustomer(
                                     id = txId,
@@ -691,7 +779,7 @@ fun AddPaymentScreen(
                                     type = txType,
                                     amount = amount,
                                     description = desc,
-                                    referenceNumber = null,
+                                    referenceNumber = refNo,
                                     sourceApp = null,
                                     transactionDate = now,
                                     createdAt = now,

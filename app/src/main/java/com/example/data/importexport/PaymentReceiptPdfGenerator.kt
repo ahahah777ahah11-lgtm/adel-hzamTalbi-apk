@@ -409,4 +409,509 @@ object PaymentReceiptPdfGenerator {
         sb.append("trailer\n<< /Size ${objects.size + 1} /Root 1 0 R >>\nstartxref\n$xrefStart\n%%EOF\n")
         out.write(sb.toString().toByteArray(Charsets.US_ASCII))
     }
+
+    // ==================== كشوفات الحسابات والطباعة (Account Statements Print & PDF) ====================
+
+    fun buildStatementFileName(customer: CustomerWithBalance): String {
+        val safeName = customer.name
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .take(24)
+            .ifBlank { "customer" }
+        return "Statement_${customer.id}_${safeName}.pdf"
+    }
+
+    fun writeCustomerStatementPdf(
+        customer: CustomerWithBalance,
+        transactions: List<TransactionWithCustomer>,
+        settings: AppSettings,
+        out: OutputStream,
+    ): Result<Unit> = runCatching {
+        val nativeAttempt = runCatching {
+            val doc = createCustomerStatementPdfDocument(customer, transactions, settings)
+            try {
+                doc.writeTo(out)
+            } finally {
+                runCatching { doc.close() }
+            }
+        }
+        if (nativeAttempt.isFailure) {
+            writeMinimalStatementPdfFallback(customer, transactions, settings, out)
+        }
+    }
+
+    fun createTempStatementFile(
+        context: Context,
+        customer: CustomerWithBalance,
+        transactions: List<TransactionWithCustomer>,
+        settings: AppSettings,
+    ): Result<File> = runCatching {
+        val dir = File(context.cacheDir, "statements").apply { mkdirs() }
+        val file = File(dir, buildStatementFileName(customer))
+        file.outputStream().use { out ->
+            writeCustomerStatementPdf(customer, transactions, settings, out).getOrThrow()
+        }
+        file
+    }
+
+    fun shareCustomerStatementPdf(
+        context: Context,
+        statementFile: File,
+        customerName: String,
+    ): Boolean {
+        return runCatching {
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                statementFile,
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "application/pdf"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "كشف حساب العميل - $customerName")
+                putExtra(Intent.EXTRA_TEXT, "مرفق كشف الحساب المالي للعميل: $customerName")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(intent, "مشاركة كشف الحساب PDF").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+            true
+        }.getOrElse { false }
+    }
+
+    fun printCustomerStatement(
+        context: Context,
+        customer: CustomerWithBalance,
+        transactions: List<TransactionWithCustomer>,
+        settings: AppSettings,
+    ): Boolean {
+        val printManager = context.getSystemService(Context.PRINT_SERVICE) as? PrintManager
+            ?: return false
+        val jobName = "كشف_حساب_${customer.name}"
+        val adapter = object : PrintDocumentAdapter() {
+            override fun onLayout(
+                oldAttributes: PrintAttributes?,
+                newAttributes: PrintAttributes,
+                cancellationSignal: CancellationSignal?,
+                callback: LayoutResultCallback,
+                extras: Bundle?,
+            ) {
+                if (cancellationSignal?.isCanceled == true) {
+                    callback.onLayoutCancelled()
+                    return
+                }
+                val pageCount = ((transactions.size.coerceAtLeast(1) - 1) / 14) + 1
+                val info = PrintDocumentInfo.Builder(buildStatementFileName(customer))
+                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                    .setPageCount(pageCount)
+                    .build()
+                callback.onLayoutFinished(info, true)
+            }
+
+            override fun onWrite(
+                pages: Array<out PageRange>,
+                destination: ParcelFileDescriptor,
+                cancellationSignal: CancellationSignal?,
+                callback: WriteResultCallback,
+            ) {
+                if (cancellationSignal?.isCanceled == true) {
+                    callback.onWriteCancelled()
+                    return
+                }
+                val doc = createCustomerStatementPdfDocument(customer, transactions, settings)
+                try {
+                    FileOutputStream(destination.fileDescriptor).use { out ->
+                        doc.writeTo(out)
+                    }
+                    callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                } catch (e: Exception) {
+                    callback.onWriteFailed(e.message)
+                } finally {
+                    doc.close()
+                }
+            }
+        }
+        printManager.print(jobName, adapter, PrintAttributes.Builder().build())
+        return true
+    }
+
+    fun printPortfolioStatement(
+        context: Context,
+        customers: List<CustomerWithBalance>,
+        settings: AppSettings,
+    ): Boolean {
+        val printManager = context.getSystemService(Context.PRINT_SERVICE) as? PrintManager
+            ?: return false
+        val activeCustomers = customers.filter { !it.isArchived }.sortedByDescending { it.balance }
+        val jobName = "كشف_الديون_الشامل_${settings.storeName}"
+        val adapter = object : PrintDocumentAdapter() {
+            override fun onLayout(
+                oldAttributes: PrintAttributes?,
+                newAttributes: PrintAttributes,
+                cancellationSignal: CancellationSignal?,
+                callback: LayoutResultCallback,
+                extras: Bundle?,
+            ) {
+                if (cancellationSignal?.isCanceled == true) {
+                    callback.onLayoutCancelled()
+                    return
+                }
+                val pageCount = ((activeCustomers.size.coerceAtLeast(1) - 1) / 16) + 1
+                val info = PrintDocumentInfo.Builder("Portfolio_Statement.pdf")
+                    .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                    .setPageCount(pageCount)
+                    .build()
+                callback.onLayoutFinished(info, true)
+            }
+
+            override fun onWrite(
+                pages: Array<out PageRange>,
+                destination: ParcelFileDescriptor,
+                cancellationSignal: CancellationSignal?,
+                callback: WriteResultCallback,
+            ) {
+                if (cancellationSignal?.isCanceled == true) {
+                    callback.onWriteCancelled()
+                    return
+                }
+                val doc = createPortfolioStatementPdfDocument(activeCustomers, settings)
+                try {
+                    FileOutputStream(destination.fileDescriptor).use { out ->
+                        doc.writeTo(out)
+                    }
+                    callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                } catch (e: Exception) {
+                    callback.onWriteFailed(e.message)
+                } finally {
+                    doc.close()
+                }
+            }
+        }
+        printManager.print(jobName, adapter, PrintAttributes.Builder().build())
+        return true
+    }
+
+    private fun createCustomerStatementPdfDocument(
+        customer: CustomerWithBalance,
+        transactions: List<TransactionWithCustomer>,
+        settings: AppSettings,
+    ): PdfDocument {
+        val doc = PdfDocument()
+        try {
+            val cur = settings.currencySymbol
+            val navy = Color.parseColor("#0F2942")
+            val teal = Color.parseColor("#0E9F8B")
+            val emerald = Color.parseColor("#1B8A5A")
+            val crimson = Color.parseColor("#C53030")
+            val slate = Color.parseColor("#4A5568")
+            val lightBg = Color.parseColor("#F4F7FA")
+            val borderGray = Color.parseColor("#CBD5E1")
+
+            val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+            val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = 1f
+                color = borderGray
+            }
+            val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = 18f
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.RIGHT
+            }
+            val subPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#D9E8F5")
+                textSize = 11.5f
+                textAlign = Paint.Align.RIGHT
+            }
+            val labelPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = slate
+                textSize = 11f
+                textAlign = Paint.Align.RIGHT
+            }
+            val valPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = navy
+                textSize = 11.5f
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.RIGHT
+            }
+            val leftValPaint = TextPaint(valPaint).apply { textAlign = Paint.Align.LEFT }
+            val rightX = PAGE_WIDTH - MARGIN
+
+            // Build chronological running balance
+            var running = 0.0
+            val rows = transactions.map { tx ->
+                if (!tx.isReversed) {
+                    running += if (tx.type.isDebit) tx.amount else -tx.amount
+                }
+                tx to running
+            }.reversed()
+
+            val rowsPerPage = 14
+            val chunks = if (rows.isEmpty()) listOf(emptyList()) else rows.chunked(rowsPerPage)
+
+            chunks.forEachIndexed { pageIndex, chunk ->
+                val pageInfo = PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, pageIndex + 1).create()
+                val page = doc.startPage(pageInfo)
+                val canvas = page.canvas
+
+                fillPaint.color = navy
+                canvas.drawRoundRect(RectF(MARGIN, MARGIN, rightX, MARGIN + 92f), 12f, 12f, fillPaint)
+                fillPaint.color = teal
+                canvas.drawRect(MARGIN, MARGIN + 86f, rightX, MARGIN + 92f, fillPaint)
+
+                canvas.drawText(settings.storeName, rightX - 16f, MARGIN + 34f, titlePaint)
+                canvas.drawText("كشف حساب تفصيلي للعميل: ${customer.name}", rightX - 16f, MARGIN + 58f, subPaint)
+                canvas.drawText("الحساب: ${customer.accountNumber} | الهاتف: ${customer.phone.ifBlank { "-" }}", rightX - 16f, MARGIN + 78f, subPaint)
+                canvas.drawText(
+                    "صفحة ${pageIndex + 1} / ${chunks.size}",
+                    MARGIN + 16f,
+                    MARGIN + 36f,
+                    TextPaint(subPaint).apply { textAlign = Paint.Align.LEFT },
+                )
+                canvas.drawText(
+                    FormatUtils.formatDate(System.currentTimeMillis()),
+                    MARGIN + 16f,
+                    MARGIN + 58f,
+                    TextPaint(subPaint).apply { textAlign = Paint.Align.LEFT },
+                )
+
+                var y = MARGIN + 110f
+                if (pageIndex == 0) {
+                    fillPaint.color = lightBg
+                    val box = RectF(MARGIN, y, rightX, y + 66f)
+                    canvas.drawRoundRect(box, 10f, 10f, fillPaint)
+                    canvas.drawRoundRect(box, 10f, 10f, strokePaint)
+
+                    val colW = (rightX - MARGIN) / 3f
+                    val centers = listOf(MARGIN + colW * 2.5f, MARGIN + colW * 1.5f, MARGIN + colW * 0.5f)
+                    val cHeader = TextPaint(labelPaint).apply { textAlign = Paint.Align.CENTER }
+                    val cVal = TextPaint(valPaint).apply { textAlign = Paint.Align.CENTER; textSize = 13f }
+
+                    canvas.drawText("إجمالي الديون", centers[0], y + 24f, cHeader)
+                    canvas.drawText(FormatUtils.formatAmount(customer.totalDebts, cur), centers[0], y + 48f, TextPaint(cVal).apply { color = crimson })
+
+                    canvas.drawText("إجمالي المدفوعات", centers[1], y + 24f, cHeader)
+                    canvas.drawText(FormatUtils.formatAmount(customer.totalPayments, cur), centers[1], y + 48f, TextPaint(cVal).apply { color = emerald })
+
+                    canvas.drawText("الرصيد النهائي المستحق", centers[2], y + 24f, cHeader)
+                    canvas.drawText(
+                        FormatUtils.formatAmount(customer.balance, cur),
+                        centers[2],
+                        y + 48f,
+                        TextPaint(cVal).apply { color = if (customer.balance > 0.001) crimson else emerald },
+                    )
+                    y += 82f
+                }
+
+                // Table header
+                fillPaint.color = Color.parseColor("#E2E8F0")
+                canvas.drawRect(MARGIN, y, rightX, y + 26f, fillPaint)
+                canvas.drawText("التاريخ والنوع", rightX - 10f, y + 17f, valPaint)
+                canvas.drawText("البيان", rightX - 180f, y + 17f, valPaint)
+                canvas.drawText("المبلغ / الرصيد", MARGIN + 10f, y + 17f, leftValPaint)
+                y += 32f
+
+                if (chunk.isEmpty()) {
+                    canvas.drawText("لا توجد قيود مالية مسجلة لهذا العميل.", rightX - 10f, y + 20f, labelPaint)
+                } else {
+                    chunk.forEach { (tx, balAfter) ->
+                        val rowRect = RectF(MARGIN, y, rightX, y + 36f)
+                        fillPaint.color = Color.WHITE
+                        canvas.drawRect(rowRect, fillPaint)
+                        canvas.drawLine(MARGIN, y + 36f, rightX, y + 36f, strokePaint)
+
+                        val typePrefix = if (tx.isReversed) "${tx.type.labelAr} (ملغاة)" else tx.type.labelAr
+                        canvas.drawText(
+                            "$typePrefix • ${FormatUtils.formatDate(tx.transactionDate)}",
+                            rightX - 8f,
+                            y + 15f,
+                            valPaint,
+                        )
+                        canvas.drawText(tx.description.take(30), rightX - 8f, y + 30f, labelPaint)
+
+                        val amtColor = when {
+                            tx.isReversed -> slate
+                            tx.type.isDebit -> crimson
+                            else -> emerald
+                        }
+                        val sign = if (tx.type.isDebit) "+" else "-"
+                        canvas.drawText(
+                            "$sign${FormatUtils.formatAmount(tx.amount, cur)}",
+                            MARGIN + 8f,
+                            y + 15f,
+                            TextPaint(leftValPaint).apply { color = amtColor },
+                        )
+                        canvas.drawText(
+                            "الرصيد: ${FormatUtils.formatAmount(balAfter, cur)}",
+                            MARGIN + 8f,
+                            y + 30f,
+                            TextPaint(labelPaint).apply { textAlign = Paint.Align.LEFT; textSize = 10f },
+                        )
+                        y += 38f
+                    }
+                }
+
+                val footerPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = slate
+                    textSize = 10f
+                    textAlign = Paint.Align.CENTER
+                }
+                canvas.drawText(
+                    "كشف حساب معتمد — تطبيق مدير الديون الذكي برو SMS",
+                    PAGE_WIDTH / 2f,
+                    PAGE_HEIGHT - 28f,
+                    footerPaint,
+                )
+                doc.finishPage(page)
+            }
+            return doc
+        } catch (t: Throwable) {
+            runCatching { doc.close() }
+            throw t
+        }
+    }
+
+    private fun createPortfolioStatementPdfDocument(
+        customers: List<CustomerWithBalance>,
+        settings: AppSettings,
+    ): PdfDocument {
+        val doc = PdfDocument()
+        try {
+            val cur = settings.currencySymbol
+            val navy = Color.parseColor("#0F2942")
+            val teal = Color.parseColor("#0E9F8B")
+            val emerald = Color.parseColor("#1B8A5A")
+            val crimson = Color.parseColor("#C53030")
+            val slate = Color.parseColor("#4A5568")
+            val borderGray = Color.parseColor("#CBD5E1")
+
+            val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+            val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = 1f
+                color = borderGray
+            }
+            val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                textSize = 18f
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.RIGHT
+            }
+            val subPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#D9E8F5")
+                textSize = 11.5f
+                textAlign = Paint.Align.RIGHT
+            }
+            val valPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = navy
+                textSize = 11.5f
+                typeface = Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.RIGHT
+            }
+            val labelPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = slate
+                textSize = 10.5f
+                textAlign = Paint.Align.RIGHT
+            }
+            val leftValPaint = TextPaint(valPaint).apply { textAlign = Paint.Align.LEFT }
+            val rightX = PAGE_WIDTH - MARGIN
+
+            val chunks = if (customers.isEmpty()) listOf(emptyList()) else customers.chunked(16)
+            val totalDebtSum = customers.sumOf { it.totalDebts }
+            val totalPaySum = customers.sumOf { it.totalPayments }
+            val netSum = totalDebtSum - totalPaySum
+
+            chunks.forEachIndexed { idx, chunk ->
+                val page = doc.startPage(PdfDocument.PageInfo.Builder(PAGE_WIDTH, PAGE_HEIGHT, idx + 1).create())
+                val canvas = page.canvas
+
+                fillPaint.color = navy
+                canvas.drawRoundRect(RectF(MARGIN, MARGIN, rightX, MARGIN + 88f), 12f, 12f, fillPaint)
+                fillPaint.color = teal
+                canvas.drawRect(MARGIN, MARGIN + 82f, rightX, MARGIN + 88f, fillPaint)
+
+                canvas.drawText(settings.storeName, rightX - 16f, MARGIN + 34f, titlePaint)
+                canvas.drawText("كشف الأرصدة والمديونيات الشامل (${customers.size} عميل)", rightX - 16f, MARGIN + 58f, subPaint)
+                canvas.drawText(
+                    "إجمالي الديون: ${FormatUtils.formatAmount(totalDebtSum, cur)} | المحصل: ${FormatUtils.formatAmount(totalPaySum, cur)} | الصافي: ${FormatUtils.formatAmount(netSum, cur)}",
+                    rightX - 16f,
+                    MARGIN + 76f,
+                    subPaint,
+                )
+
+                var y = MARGIN + 108f
+                fillPaint.color = Color.parseColor("#E2E8F0")
+                canvas.drawRect(MARGIN, y, rightX, y + 26f, fillPaint)
+                canvas.drawText("العميل والحساب", rightX - 10f, y + 17f, valPaint)
+                canvas.drawText("الرصيد المتبقي", MARGIN + 10f, y + 17f, leftValPaint)
+                y += 32f
+
+                chunk.forEach { c ->
+                    canvas.drawLine(MARGIN, y + 34f, rightX, y + 34f, strokePaint)
+                    canvas.drawText(c.name, rightX - 8f, y + 14f, valPaint)
+                    canvas.drawText("هاتف: ${c.phone.ifBlank { "-" }} • عمليات: ${c.transactionCount}", rightX - 8f, y + 29f, labelPaint)
+                    canvas.drawText(
+                        FormatUtils.formatAmount(c.balance, cur),
+                        MARGIN + 8f,
+                        y + 20f,
+                        TextPaint(leftValPaint).apply { color = if (c.balance > 0.001) crimson else emerald },
+                    )
+                    y += 36f
+                }
+
+                doc.finishPage(page)
+            }
+            return doc
+        } catch (t: Throwable) {
+            runCatching { doc.close() }
+            throw t
+        }
+    }
+
+    private fun writeMinimalStatementPdfFallback(
+        customer: CustomerWithBalance,
+        transactions: List<TransactionWithCustomer>,
+        settings: AppSettings,
+        out: OutputStream,
+    ) {
+        fun esc(raw: String): String = raw
+            .replace("\\", "\\\\")
+            .replace("(", "\\(")
+            .replace(")", "\\)")
+            .map { if (it.code in 32..126) it else '?' }
+            .joinToString("")
+
+        val contentStream = buildString {
+            append("BT\n/F1 16 Tf\n50 780 Td\n")
+            append("(${esc("Account Statement - Customer ID: ${customer.id}")}) Tj\n")
+            append("/F1 11 Tf\n0 -24 Td\n")
+            append("(${esc("Total Debts: ${customer.totalDebts} ${settings.currencySymbol}")}) Tj\n")
+            append("0 -18 Td\n")
+            append("(${esc("Total Payments: ${customer.totalPayments} ${settings.currencySymbol}")}) Tj\n")
+            append("0 -18 Td\n")
+            append("(${esc("Net Balance: ${customer.balance} ${settings.currencySymbol}")}) Tj\n")
+            append("0 -18 Td\n")
+            append("(${esc("Transactions Count: ${transactions.size}")}) Tj\n")
+            append("ET\n")
+        }
+        val objects = listOf(
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+            "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+            "5 0 obj\n<< /Length ${contentStream.toByteArray(Charsets.US_ASCII).size} >>\nstream\n${contentStream}endstream\nendobj\n",
+        )
+        val sb = StringBuilder("%PDF-1.4\n")
+        val offsets = mutableListOf<Int>()
+        objects.forEach { obj ->
+            offsets.add(sb.toString().toByteArray(Charsets.US_ASCII).size)
+            sb.append(obj)
+        }
+        val xrefStart = sb.toString().toByteArray(Charsets.US_ASCII).size
+        sb.append("xref\n0 ${objects.size + 1}\n0000000000 65535 f \n")
+        offsets.forEach { offset -> sb.append("%010d 00000 n \n".format(offset)) }
+        sb.append("trailer\n<< /Size ${objects.size + 1} /Root 1 0 R >>\nstartxref\n$xrefStart\n%%EOF\n")
+        out.write(sb.toString().toByteArray(Charsets.US_ASCII))
+    }
 }
