@@ -26,7 +26,7 @@ enum class ExportFormat(val titleAr: String, val extension: String, val mimeType
 
 class ExportManager {
     fun buildCustomersTable(customers: List<CustomerWithBalance>): Pair<List<String>, List<List<String>>> {
-        val headers = listOf("المعرف", "اسم العميل", "رقم الهاتف", "رقم الحساب", "إجمالي الديون", "إجمالي المدفوعات", "الرصيد المستحق", "الحالة")
+        val headers = listOf("المعرف", "اسم العميل", "رقم الهاتف", "رقم الحساب", "إجمالي الديون", "إجمالي المدفوعات", "الرصيد المستحق", "الحالة", "ملاحظات")
         val rows = customers.map { c ->
             listOf(
                 c.id.toString(),
@@ -40,9 +40,17 @@ class ExportManager {
                     c.balance > 0.001 -> "مدين"
                     else -> "مسدد"
                 },
+                c.notes,
             )
         }
         return headers to rows
+    }
+
+    fun exportCustomersCsvBytes(customers: List<CustomerWithBalance>): ByteArray {
+        val (headers, rows) = buildCustomersTable(customers)
+        val bos = ByteArrayOutputStream()
+        writeCsv(headers, rows, bos)
+        return bos.toByteArray()
     }
 
     fun buildTransactionsTable(transactions: List<TransactionWithCustomer>): Pair<List<String>, List<List<String>>> {

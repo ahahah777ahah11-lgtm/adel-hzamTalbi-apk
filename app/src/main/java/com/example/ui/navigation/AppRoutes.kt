@@ -8,6 +8,8 @@ object AppRoutes {
     const val ACCOUNT_STATEMENT = "account_statement/{customerId}"
     const val ADD_DEBT = "add_debt?customerId={customerId}"
     const val ADD_PAYMENT = "add_payment?customerId={customerId}"
+    const val ADD_TRANSACTION = "add_transaction?customerId={customerId}&initialType={initialType}"
+    const val DEBTS_OVERVIEW = "debts_overview"
     const val TRANSACTIONS_LOG = "transactions_log"
     const val REMINDERS = "reminders"
     const val TRANSFERS = "transfers"
@@ -35,6 +37,10 @@ object AppRoutes {
     fun addPayment(customerId: Long? = null): String =
         if (customerId != null && customerId > 0L) "add_payment?customerId=$customerId"
         else "add_payment"
+
+    fun addTransaction(customerId: Long? = null, initialType: String = "DEBT"): String =
+        if (customerId != null && customerId > 0L) "add_transaction?customerId=$customerId&initialType=$initialType"
+        else "add_transaction?initialType=$initialType"
 
     fun smsCenter(customerId: Long? = null): String =
         if (customerId != null && customerId > 0L) "sms_center?customerId=$customerId"

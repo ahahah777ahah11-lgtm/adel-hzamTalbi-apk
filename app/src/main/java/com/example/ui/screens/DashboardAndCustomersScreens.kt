@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForwardIos
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddCard
@@ -39,6 +40,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.CurrencyExchange
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileUpload
@@ -112,7 +114,10 @@ import com.example.ui.SmartDebtViewModel
 import com.example.ui.components.AdvancedSearchFilterBar
 import com.example.ui.components.AmountOutlinedField
 import com.example.ui.components.ArabicTopBar
+import androidx.compose.material3.CircularProgressIndicator
+import com.example.data.importexport.PreviewRowStatus
 import com.example.ui.components.CollectionDonutChart
+import com.example.ui.components.CustomersPortfolioSummaryCard
 import com.example.ui.components.DateRangePreset
 import com.example.ui.components.DebtVsPaymentBarChart
 import com.example.ui.components.DebtVsPaymentColumnChart
@@ -591,6 +596,9 @@ fun CustomersScreen(
     val customers by viewModel.customers.collectAsStateWithLifecycle()
     val reminders by viewModel.reminders.collectAsStateWithLifecycle()
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val importInspection by viewModel.importInspection.collectAsStateWithLifecycle()
+    val importBusy by viewModel.importBusy.collectAsStateWithLifecycle()
+    val importError by viewModel.importError.collectAsStateWithLifecycle()
     var search by remember { mutableStateOf("") }
     var selectedFilter by remember { mutableStateOf(CustomerFilter.ALL) }
     var selectedDatePreset by remember { mutableStateOf(DateRangePreset.ALL) }
@@ -598,9 +606,29 @@ fun CustomersScreen(
     var customEndMillis by remember { mutableStateOf<Long?>(null) }
     var selectedSort by remember { mutableStateOf(CustomerSortOption.HIGHEST_BALANCE) }
     var showQuickAddCustomerDialog by remember { mutableStateOf(false) }
+    var showCsvImportDialog by remember { mutableStateOf(false) }
+    var csvReplaceExisting by remember { mutableStateOf(false) }
     val financial = LocalFinancialColors.current
     val cur = settings.currencySymbol
     val context = LocalContext.current
+
+    val exportCsvLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportCustomersDatabaseCsvToUri(uri)
+        }
+    }
+
+    val importCsvLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            csvReplaceExisting = false
+            showCsvImportDialog = true
+            viewModel.inspectImportUri(uri)
+        }
+    }
 
     val activeRemindersByCustomer = remember(reminders) {
         reminders.filter { it.status != ReminderStatus.COMPLETED }.groupBy { it.customerId }
@@ -614,8 +642,15 @@ fun CustomersScreen(
         c
     }
 
+    val activePortfolio = remember(customers) {
+        customers.filter { !it.isArchived }
+    }
+    val summaryTotalDebts = remember(activePortfolio) { activePortfolio.sumOf { it.totalDebts } }
+    val summaryTotalCollected = remember(activePortfolio) { activePortfolio.sumOf { it.totalPayments } }
+
     val filtered = remember(customers, activeRemindersByCustomer, search, selectedFilter, selectedDatePreset, customStartMillis, customEndMillis, selectedSort) {
         val q = FormatUtils.normalizeArabicText(search)
+        val qPhone = FormatUtils.normalizePhone(search)
         val base = customers.filter { c ->
             val matchesFilter = when (selectedFilter) {
                 CustomerFilter.ALL -> !c.isArchived
@@ -627,6 +662,7 @@ fun CustomersScreen(
             val matchesQuery = q.isBlank() ||
                 FormatUtils.normalizeArabicText(c.name).contains(q) ||
                 c.phone.contains(q) ||
+                (qPhone.isNotBlank() && FormatUtils.normalizePhone(c.phone).contains(qPhone)) ||
                 c.accountNumber.lowercase().contains(q)
             val custReminders = activeRemindersByCustomer[c.id].orEmpty()
             val matchesDueDate = if (selectedDatePreset == DateRangePreset.ALL) {
@@ -677,8 +713,14 @@ fun CustomersScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 840.dp)
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -710,7 +752,7 @@ fun CustomersScreen(
                 AdvancedSearchFilterBar(
                     searchQuery = search,
                     onSearchQueryChange = { search = it },
-                    searchPlaceholder = "ابحث باسم العميل، الهاتف، أو رقم الحساب...",
+                    searchPlaceholder = "ابحث باسم العميل أو رقم الهاتف...",
                     searchTestTag = "customers_search_input",
                     datePresets = listOf(
                         DateRangePreset.ALL,
@@ -769,20 +811,49 @@ fun CustomersScreen(
                 )
             }
 
-            if (filtered.isEmpty()) {
-                EmptyStateView(
-                    icon = Icons.Default.People,
-                    title = "لا يوجد عملاء مطابقون",
-                    subtitle = "اضغط على زر إضافة عميل أو عدّل معايير البحث والتصفية المتقدمة.",
-                    actionLabel = "إضافة عميل",
-                    onAction = { onNavigate(AppRoutes.addEditCustomer()) },
-                )
-            } else {
-                LazyColumn(
-                    modifier = Modifier.testTag("customers_list"),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 132.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 840.dp)
+                    .weight(1f)
+                    .testTag("customers_list"),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 132.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                item(key = "customers_summary_card") {
+                    CustomersPortfolioSummaryCard(
+                        totalDebts = summaryTotalDebts,
+                        totalCollected = summaryTotalCollected,
+                        currency = cur,
+                        customersCount = activePortfolio.size,
+                        onExportCsv = {
+                            exportCsvLauncher.launch("SmartDebt_customers_backup.csv")
+                        },
+                        onImportCsv = {
+                            importCsvLauncher.launch(
+                                arrayOf(
+                                    "text/csv",
+                                    "text/comma-separated-values",
+                                    "application/csv",
+                                    "text/plain",
+                                    "*/*",
+                                )
+                            )
+                        },
+                    )
+                }
+
+                if (filtered.isEmpty()) {
+                    item(key = "empty_customers_state") {
+                        EmptyStateView(
+                            icon = Icons.Default.People,
+                            title = "لا يوجد عملاء مطابقون",
+                            subtitle = "اضغط على زر إضافة عميل أو استورد ملف CSV أو عدّل البحث.",
+                            actionLabel = "إضافة عميل",
+                            onAction = { onNavigate(AppRoutes.addEditCustomer()) },
+                        )
+                    }
+                } else {
                     items(filtered, key = { it.id }) { cust ->
                         val nextDue = activeRemindersByCustomer[cust.id]?.minOfOrNull { it.dueDate }
                         CustomerListItemCard(
@@ -878,6 +949,107 @@ fun CustomersScreen(
             },
         )
     }
+
+    if (showCsvImportDialog) {
+        val inspection = importInspection
+        AlertDialog(
+            onDismissRequest = {
+                if (!importBusy) {
+                    showCsvImportDialog = false
+                    viewModel.clearImportState()
+                }
+            },
+            title = { Text("استيراد قاعدة البيانات من CSV", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    when {
+                        importBusy -> {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                                Text("جاري فحص ومعالجة ملف CSV بأمان...")
+                            }
+                        }
+                        importError != null -> {
+                            Text(
+                                text = importError ?: "تعذر استيراد الملف",
+                                color = financial.danger,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        inspection != null -> {
+                            val readyCount = inspection.previewRows.count { it.status == PreviewRowStatus.READY_NEW }
+                            val dupCount = inspection.previewRows.count {
+                                it.status == PreviewRowStatus.DUPLICATE_EXISTING || it.status == PreviewRowStatus.DUPLICATE_IN_FILE
+                            }
+                            val errCount = inspection.previewRows.count { it.status == PreviewRowStatus.INVALID_ERROR }
+                            Text(
+                                text = "الملف: ${inspection.fileName}",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = "السجلات الجاهزة للاستيراد: $readyCount • المكررة: $dupCount • غير الصالحة: $errCount",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "استبدال البيانات الحالية",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Switch(
+                                    checked = csvReplaceExisting,
+                                    onCheckedChange = { checked ->
+                                        csvReplaceExisting = checked
+                                        viewModel.setReplacePreviousOnImport(checked)
+                                    },
+                                    modifier = Modifier.testTag("customers_csv_replace_switch"),
+                                )
+                            }
+                        }
+                        else -> {
+                            Text("اختر ملف CSV صالحاً لاستيراد العملاء والأرصدة.")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                val readyCount = inspection?.previewRows?.count { it.status == PreviewRowStatus.READY_NEW } ?: 0
+                if (inspection != null && !importBusy && readyCount > 0) {
+                    Button(
+                        onClick = {
+                            viewModel.confirmAndExecuteImport(
+                                createSafetyBackup = true,
+                                replacePreviousData = csvReplaceExisting,
+                            )
+                            showCsvImportDialog = false
+                        },
+                        modifier = Modifier.testTag("customers_csv_confirm_import_button"),
+                    ) {
+                        Text("استيراد ($readyCount)")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showCsvImportDialog = false
+                        viewModel.clearImportState()
+                    },
+                ) {
+                    Text("إغلاق")
+                }
+            },
+        )
+    }
 }
 
 @Composable
@@ -960,19 +1132,34 @@ private fun CustomerListItemCard(
                     }
                 }
                 Spacer(modifier = Modifier.width(8.dp))
-                Column(horizontalAlignment = Alignment.End) {
-                    val balColor = if (customer.balance > 0.001) dangerColor else successColor
-                    Text(
-                        text = FormatUtils.formatAmount(customer.balance, currency),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = balColor,
-                    )
-                    Text(
-                        text = if (customer.balance > 0.001) "عليه" else "مسدد",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = balColor,
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(horizontalAlignment = Alignment.End) {
+                        val balColor = if (customer.balance > 0.001) dangerColor else successColor
+                        Text(
+                            text = FormatUtils.formatAmount(customer.balance, currency),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = balColor,
+                        )
+                        Text(
+                            text = if (customer.balance > 0.001) "عليه" else "مسدد",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = balColor,
+                        )
+                    }
+                    IconButton(
+                        onClick = onClick,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("customer_details_btn_${customer.id}"),
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowForwardIos,
+                            contentDescription = "عرض تفاصيل العميل ${customer.name}",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
                 }
             }
 
@@ -1286,8 +1473,8 @@ fun CustomerDetailScreen(
     onBack: () -> Unit,
     onNavigate: (String) -> Unit,
 ) {
-    val customerFlow = remember(customerId) { viewModel.repository.observeCustomerWithBalance(customerId) }
-    val statementFlow = remember(customerId) { viewModel.repository.observeCustomerStatement(customerId) }
+    val customerFlow = remember(customerId) { viewModel.observeCustomerDetail(customerId) }
+    val statementFlow = remember(customerId) { viewModel.observeCustomerStatement(customerId) }
     val customer by customerFlow.collectAsStateWithLifecycle(initialValue = null)
     val txs by statementFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val settings by viewModel.settings.collectAsStateWithLifecycle()
@@ -1297,6 +1484,7 @@ fun CustomerDetailScreen(
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var receiptTargetTx by remember { mutableStateOf<TransactionWithCustomer?>(null) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -1318,8 +1506,21 @@ fun CustomerDetailScreen(
                         ) {
                             Icon(Icons.Default.Share, contentDescription = "مشاركة رصيد العميل")
                         }
-                        IconButton(onClick = { onNavigate(AppRoutes.addEditCustomer(customerId)) }) {
+                        IconButton(
+                            onClick = { onNavigate(AppRoutes.addEditCustomer(customerId)) },
+                            modifier = Modifier.testTag("detail_edit_customer_button"),
+                        ) {
                             Icon(Icons.Default.Edit, contentDescription = "تعديل العميل")
+                        }
+                        IconButton(
+                            onClick = { showDeleteConfirm = true },
+                            modifier = Modifier.testTag("detail_delete_customer_button"),
+                        ) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "حذف العميل",
+                                tint = financial.danger,
+                            )
                         }
                     }
                 },
@@ -1339,14 +1540,21 @@ fun CustomerDetailScreen(
             return@Scaffold
         }
 
-        LazyColumn(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            contentAlignment = Alignment.TopCenter,
         ) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 840.dp)
+                    .testTag("customer_detail_list"),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
             item {
                 FinancialCard(containerColor = MaterialTheme.colorScheme.primary) {
                     Text(
@@ -1551,6 +1759,37 @@ fun CustomerDetailScreen(
                 }
             }
         }
+        }
+    }
+
+    if (showDeleteConfirm && customer != null) {
+        val currentCust = customer!!
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("حذف العميل", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "هل تريد حذف (${currentCust.name}) من القائمة؟ إذا كان للعميل حركات مالية مسجلة فسيتم الحفاظ على السجل المحاسبي تلقائياً."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeleteConfirm = false
+                        viewModel.deleteCustomerSafely(currentCust.id, onSuccess = onBack)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = financial.danger),
+                    modifier = Modifier.testTag("confirm_delete_customer_button"),
+                ) {
+                    Text("تأكيد الحذف")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("إلغاء")
+                }
+            },
+        )
     }
 
     receiptTargetTx?.let { tx ->

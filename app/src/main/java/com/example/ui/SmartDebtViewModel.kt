@@ -30,8 +30,10 @@ import com.example.data.local.AuditLogEntity
 import com.example.data.local.CustomerWithBalance
 import com.example.data.local.CustomerWithDebts
 import com.example.data.local.DashboardSummary
+import com.example.data.local.DebtsEntity
 import com.example.data.local.MessageLogEntity
 import com.example.data.local.MessageStatus
+import com.example.data.local.PaymentsEntity
 import com.example.data.local.ReminderStatus
 import com.example.data.local.ReminderWithCustomer
 import com.example.data.local.SmartDebtDatabase
@@ -42,8 +44,12 @@ import com.example.data.local.TransferCompany
 import com.example.data.local.TransferWithCustomer
 import com.example.data.preferences.AppSettings
 import com.example.data.preferences.SettingsDataStore
+import com.example.data.sms.AndroidSmsManagerGateway
+import com.example.data.sms.AutoReminderDispatchReport
+import com.example.data.sms.AutoReminderItemStatus
 import com.example.data.sms.DirectSmsSender
 import com.example.data.sms.SmsDispatchResult
+import com.example.data.sms.SmsGateway
 import com.example.data.sms.SmsInboxMessage
 import com.example.data.sms.SmsTemplateEngine
 import com.example.data.update.AppUpdateChecker
@@ -61,6 +67,7 @@ import com.example.worker.OverdueReminderWorker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -68,6 +75,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -108,6 +116,12 @@ class SmartDebtViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val transactions: StateFlow<List<TransactionWithCustomer>> = repository.observeAllTransactions()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val debts: StateFlow<List<DebtsEntity>> = repository.observeAllDebts()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val payments: StateFlow<List<PaymentsEntity>> = repository.observeAllPayments()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val reminders: StateFlow<List<ReminderWithCustomer>> = repository.observeAllReminders()
@@ -220,7 +234,7 @@ class SmartDebtViewModel(
         openingBalance: Double,
         onSuccess: (Long) -> Unit,
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeHandler) {
             when (val res = repository.createCustomer(name, phone, accountNumber, creditLimit, notes, openingBalance)) {
                 is AccountingResult.Success -> {
                     emitFeedback(res.message)
@@ -241,8 +255,26 @@ class SmartDebtViewModel(
         isArchived: Boolean,
         onSuccess: () -> Unit,
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeHandler) {
             when (val res = repository.updateCustomer(customerId, name, phone, accountNumber, creditLimit, notes, isArchived)) {
+                is AccountingResult.Success -> {
+                    emitFeedback(res.message)
+                    onSuccess()
+                }
+                is AccountingResult.Error -> emitFeedback(res.reason, isError = true)
+            }
+        }
+    }
+
+    fun observeCustomerDetail(customerId: Long): Flow<CustomerWithBalance?> =
+        repository.observeCustomerWithBalance(customerId)
+
+    fun observeCustomerStatement(customerId: Long): Flow<List<TransactionWithCustomer>> =
+        repository.observeCustomerStatement(customerId)
+
+    fun deleteCustomerSafely(customerId: Long, onSuccess: () -> Unit) {
+        viewModelScope.launch(safeHandler) {
+            when (val res = repository.deleteCustomerSafely(customerId)) {
                 is AccountingResult.Success -> {
                     emitFeedback(res.message)
                     onSuccess()
@@ -259,6 +291,7 @@ class SmartDebtViewModel(
         description: String,
         dateMillis: Long,
         referenceNumber: String? = null,
+        dueDate: Long? = null,
         onSuccess: () -> Unit,
     ) {
         recordTransactionWithId(
@@ -268,6 +301,7 @@ class SmartDebtViewModel(
             description = description,
             dateMillis = dateMillis,
             referenceNumber = referenceNumber,
+            dueDate = dueDate,
             onSuccess = { _ -> onSuccess() },
         )
     }
@@ -279,6 +313,7 @@ class SmartDebtViewModel(
         description: String,
         dateMillis: Long,
         referenceNumber: String? = null,
+        dueDate: Long? = null,
         onSuccess: (Long) -> Unit,
     ) {
         viewModelScope.launch {
@@ -292,6 +327,7 @@ class SmartDebtViewModel(
                 referenceNumber = referenceNumber,
                 allowOverpayment = curSettings.allowOverpayment,
                 duplicateWindowMinutes = curSettings.duplicateWindowMinutes,
+                dueDate = dueDate,
             )
             when (res) {
                 is AccountingResult.Success -> {
@@ -684,6 +720,87 @@ class SmartDebtViewModel(
         }
     }
 
+    fun sendAutomaticDueDebtReminders(
+        context: Context,
+        templateBody: String? = null,
+        gateway: SmsGateway = AndroidSmsManagerGateway,
+        onNeedPermission: () -> Unit = {},
+        onCompleted: (AutoReminderDispatchReport) -> Unit = {},
+    ) {
+        if (!DirectSmsSender.hasSendSmsPermission(context)) {
+            onNeedPermission()
+            return
+        }
+        viewModelScope.launch(safeHandler) {
+            val liveCustomers = repository.observeCustomersWithBalance().first()
+            val liveDebts = repository.observeAllDebts().first()
+            val liveReminders = repository.observeAllReminders().first()
+            val liveLogs = repository.observeMessageLogs().first()
+            val curSettings = settings.value
+
+            val report = withContext(Dispatchers.IO) {
+                DirectSmsSender.sendAutomaticDueDebtReminders(
+                    context = context,
+                    customers = liveCustomers,
+                    debts = liveDebts,
+                    reminders = liveReminders,
+                    recentMessageLogs = liveLogs,
+                    settings = curSettings,
+                    templateBody = templateBody,
+                    gateway = gateway,
+                )
+            }
+
+            if (report.permissionDenied) {
+                onNeedPermission()
+                emitFeedback("يرجى منح صلاحية SEND_SMS لتفعيل إرسال تذكيرات الديون التلقائية.", isError = true)
+                onCompleted(report)
+                return@launch
+            }
+
+            for (item in report.items) {
+                when (item.status) {
+                    AutoReminderItemStatus.SENT -> {
+                        repository.logDirectSmsDispatch(
+                            customerId = item.customerId,
+                            customerName = item.customerName,
+                            phone = item.phone,
+                            messageBody = item.messageBody,
+                            templateName = "تذكير تلقائي بالديون المستحقة",
+                            status = MessageStatus.SENT_VIA_SMS_MANAGER,
+                            details = item.detail,
+                        )
+                    }
+                    AutoReminderItemStatus.FAILED -> {
+                        repository.logDirectSmsDispatch(
+                            customerId = item.customerId,
+                            customerName = item.customerName,
+                            phone = item.phone,
+                            messageBody = item.messageBody,
+                            templateName = "تذكير تلقائي بالديون المستحقة",
+                            status = MessageStatus.SEND_FAILED,
+                            details = item.detail,
+                        )
+                    }
+                    else -> Unit
+                }
+            }
+
+            when {
+                report.evaluatedDueCustomersCount == 0 -> {
+                    emitFeedback("لا توجد ديون مستحقة أو متأخرة تتطلب إرسال تذكير تلقائي حالياً.")
+                }
+                else -> {
+                    emitFeedback(
+                        "التذكير التلقائي للديون المستحقة: أُرسلت ${report.sentCount}، مكررة خلال 24 ساعة ${report.skippedCooldownCount}، بدون رقم ${report.skippedNoPhoneCount}، تعذرت ${report.failedCount}",
+                        isError = report.sentCount == 0 && report.failedCount > 0,
+                    )
+                }
+            }
+            onCompleted(report)
+        }
+    }
+
     fun updateMessageStatus(logId: Long, status: MessageStatus) {
         viewModelScope.launch {
             repository.updateMessageStatus(logId, status)
@@ -1042,6 +1159,26 @@ class SmartDebtViewModel(
             }
             result.onSuccess { emitFeedback("تم تصدير (${dataset.titleAr}) بصيغة ${format.extension.uppercase()} بنجاح") }
                 .onFailure { emitFeedback("فشل التصدير: ${it.message}", isError = true) }
+        }
+    }
+
+    fun exportCustomersDatabaseCsvToUri(uri: Uri) {
+        viewModelScope.launch(safeHandler) {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val liveCustomers = repository.observeCustomersWithBalance().first()
+                    val bytes = exportManager.exportCustomersCsvBytes(liveCustomers)
+                    getApplication<Application>().contentResolver.openOutputStream(uri)?.use { out ->
+                        out.write(bytes)
+                    } ?: error("تعذر فتح مسار حفظ ملف CSV")
+                    liveCustomers.size
+                }
+            }
+            res.onSuccess { count ->
+                emitFeedback("تم تصدير قاعدة بيانات العملاء ($count عميل) بصيغة CSV بنجاح")
+            }.onFailure { err ->
+                emitFeedback("فشل تصدير ملف CSV: ${err.message}", isError = true)
+            }
         }
     }
 

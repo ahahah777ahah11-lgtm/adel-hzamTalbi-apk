@@ -9,6 +9,13 @@ import android.os.Build
 import android.provider.Telephony
 import android.telephony.SmsManager
 import androidx.core.content.ContextCompat
+import com.example.data.local.CustomerWithBalance
+import com.example.data.local.DebtsEntity
+import com.example.data.local.MessageLogEntity
+import com.example.data.local.MessageStatus
+import com.example.data.local.ReminderStatus
+import com.example.data.local.ReminderWithCustomer
+import com.example.data.preferences.AppSettings
 import com.example.util.FormatUtils
 
 data class SmsInboxMessage(
@@ -16,6 +23,34 @@ data class SmsInboxMessage(
     val address: String,
     val body: String,
     val timestamp: Long,
+)
+
+enum class AutoReminderItemStatus {
+    SENT,
+    FAILED,
+    SKIPPED_NO_PHONE,
+    SKIPPED_COOLDOWN,
+    PERMISSION_DENIED,
+}
+
+data class AutoReminderDispatchItem(
+    val customerId: Long,
+    val customerName: String,
+    val phone: String,
+    val amountDue: Double,
+    val messageBody: String,
+    val status: AutoReminderItemStatus,
+    val detail: String = "",
+)
+
+data class AutoReminderDispatchReport(
+    val evaluatedDueCustomersCount: Int,
+    val sentCount: Int,
+    val failedCount: Int,
+    val skippedNoPhoneCount: Int,
+    val skippedCooldownCount: Int,
+    val permissionDenied: Boolean,
+    val items: List<AutoReminderDispatchItem>,
 )
 
 sealed class SmsDispatchResult {
@@ -65,6 +100,8 @@ object AndroidSmsManagerGateway : SmsGateway {
 object DirectSmsSender {
     const val ACTION_SMS_SENT = "com.smartdebt.app.SMS_SENT"
     const val EXTRA_LOG_ID = "extra_sms_log_id"
+    const val DEFAULT_DUE_DEBT_TEMPLATE =
+        "عزيزي {اسم_العميل}، نذكركم باستحقاق مبلغ {الرصيد} لصالح {اسم_المتجر} بتاريخ {التاريخ}. نرجو المبادرة بالسداد أو التواصل على {رقم_التواصل}."
 
     fun hasSendSmsPermission(context: Context): Boolean {
         return ContextCompat.checkSelfPermission(
@@ -133,6 +170,20 @@ object DirectSmsSender {
         }
     }
 
+    fun sendSmsToCustomer(
+        context: Context,
+        customerPhone: String,
+        message: String,
+        logId: Long = 0L,
+        gateway: SmsGateway = AndroidSmsManagerGateway,
+    ): SmsDispatchResult = sendDebtAlert(
+        context = context,
+        phone = customerPhone,
+        messageBody = message,
+        logId = logId,
+        gateway = gateway,
+    )
+
     fun sendDebtAlert(
         context: Context,
         phone: String,
@@ -164,6 +215,218 @@ object DirectSmsSender {
         } catch (ex: Exception) {
             SmsDispatchResult.Failed(ex.message ?: "تعذر إرسال الرسالة عبر الشبكة")
         }
+    }
+
+    fun findDueDebtCustomers(
+        customers: List<CustomerWithBalance>,
+        debts: List<DebtsEntity>,
+        reminders: List<ReminderWithCustomer>,
+        settings: AppSettings,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): List<CustomerWithBalance> {
+        val overdueThresholdMillis = settings.overdueDaysThreshold.coerceAtLeast(1) * 86_400_000L
+        val dueDebtCustomerIds = debts
+            .asSequence()
+            .filter { !it.isReversed && it.dueDate != null && it.dueDate <= nowMillis }
+            .map { it.customerId }
+            .toSet()
+        val dueReminderCustomerIds = reminders
+            .asSequence()
+            .filter {
+                it.status != ReminderStatus.COMPLETED &&
+                    (it.status == ReminderStatus.OVERDUE || it.dueDate <= nowMillis)
+            }
+            .map { it.customerId }
+            .toSet()
+
+        return customers.filter { customer ->
+            if (customer.isArchived || customer.balance <= 0.001) return@filter false
+            val hasDueDebtRow = customer.id in dueDebtCustomerIds
+            val hasDueReminder = customer.id in dueReminderCustomerIds || customer.overdueRemindersCount > 0
+            val isAgedOverdue = customer.lastTransactionDate != null &&
+                (nowMillis - customer.lastTransactionDate) >= overdueThresholdMillis
+            hasDueDebtRow || hasDueReminder || isAgedOverdue
+        }
+    }
+
+    /**
+     * Automatically sends SMS payment reminders to customers whose debts are currently due or overdue.
+     * Avoids duplicate spam by skipping customers reminded via SmsManager within [cooldownMillis].
+     */
+    fun sendAutomaticDueDebtReminders(
+        context: Context,
+        customers: List<CustomerWithBalance>,
+        debts: List<DebtsEntity>,
+        reminders: List<ReminderWithCustomer>,
+        recentMessageLogs: List<MessageLogEntity>,
+        settings: AppSettings,
+        nowMillis: Long = System.currentTimeMillis(),
+        cooldownMillis: Long = 24L * 3_600_000L,
+        templateBody: String? = null,
+        gateway: SmsGateway = AndroidSmsManagerGateway,
+    ): AutoReminderDispatchReport {
+        val dueCustomers = findDueDebtCustomers(
+            customers = customers,
+            debts = debts,
+            reminders = reminders,
+            settings = settings,
+            nowMillis = nowMillis,
+        )
+        if (!hasSendSmsPermission(context)) {
+            return AutoReminderDispatchReport(
+                evaluatedDueCustomersCount = dueCustomers.size,
+                sentCount = 0,
+                failedCount = 0,
+                skippedNoPhoneCount = 0,
+                skippedCooldownCount = 0,
+                permissionDenied = true,
+                items = dueCustomers.map {
+                    AutoReminderDispatchItem(
+                        customerId = it.id,
+                        customerName = it.name,
+                        phone = it.phone,
+                        amountDue = it.balance,
+                        messageBody = "",
+                        status = AutoReminderItemStatus.PERMISSION_DENIED,
+                        detail = "صلاحية SEND_SMS غير ممنوحة",
+                    )
+                },
+            )
+        }
+
+        val activeTemplate = templateBody?.takeIf { it.isNotBlank() } ?: DEFAULT_DUE_DEBT_TEMPLATE
+        val recentSentCustomerIds = recentMessageLogs
+            .asSequence()
+            .filter {
+                it.status == MessageStatus.SENT_VIA_SMS_MANAGER &&
+                    (nowMillis - it.createdAt) in 0L..cooldownMillis
+            }
+            .map { it.customerId }
+            .toSet()
+
+        val items = mutableListOf<AutoReminderDispatchItem>()
+        var sentCount = 0
+        var failedCount = 0
+        var skippedNoPhoneCount = 0
+        var skippedCooldownCount = 0
+
+        for (customer in dueCustomers) {
+            val normalizedPhone = FormatUtils.normalizePhone(customer.phone)
+            if (normalizedPhone.isBlank() || normalizedPhone.count { it.isDigit() } < 5) {
+                skippedNoPhoneCount++
+                items += AutoReminderDispatchItem(
+                    customerId = customer.id,
+                    customerName = customer.name,
+                    phone = customer.phone,
+                    amountDue = customer.balance,
+                    messageBody = "",
+                    status = AutoReminderItemStatus.SKIPPED_NO_PHONE,
+                    detail = "لا يوجد رقم هاتف صالح",
+                )
+                continue
+            }
+
+            if (customer.id in recentSentCustomerIds) {
+                skippedCooldownCount++
+                items += AutoReminderDispatchItem(
+                    customerId = customer.id,
+                    customerName = customer.name,
+                    phone = normalizedPhone,
+                    amountDue = customer.balance,
+                    messageBody = "",
+                    status = AutoReminderItemStatus.SKIPPED_COOLDOWN,
+                    detail = "تم إرسال تذكير تلقائي للعميل خلال آخر 24 ساعة",
+                )
+                continue
+            }
+
+            val body = SmsTemplateEngine.renderMessage(
+                templateBody = activeTemplate,
+                customer = customer,
+                settings = settings,
+                nowMillis = nowMillis,
+            )
+
+            when (
+                val dispatch = sendDebtAlert(
+                    context = context,
+                    phone = normalizedPhone,
+                    messageBody = body,
+                    logId = customer.id,
+                    gateway = gateway,
+                )
+            ) {
+                is SmsDispatchResult.Dispatched -> {
+                    sentCount++
+                    items += AutoReminderDispatchItem(
+                        customerId = customer.id,
+                        customerName = customer.name,
+                        phone = dispatch.normalizedPhone,
+                        amountDue = customer.balance,
+                        messageBody = body,
+                        status = AutoReminderItemStatus.SENT,
+                        detail = "تم الإرسال تلقائياً (${dispatch.partsCount} جزء)",
+                    )
+                }
+                SmsDispatchResult.PermissionDenied -> {
+                    return AutoReminderDispatchReport(
+                        evaluatedDueCustomersCount = dueCustomers.size,
+                        sentCount = sentCount,
+                        failedCount = failedCount,
+                        skippedNoPhoneCount = skippedNoPhoneCount,
+                        skippedCooldownCount = skippedCooldownCount,
+                        permissionDenied = true,
+                        items = items,
+                    )
+                }
+                is SmsDispatchResult.Failed -> {
+                    failedCount++
+                    items += AutoReminderDispatchItem(
+                        customerId = customer.id,
+                        customerName = customer.name,
+                        phone = normalizedPhone,
+                        amountDue = customer.balance,
+                        messageBody = body,
+                        status = AutoReminderItemStatus.FAILED,
+                        detail = dispatch.reason,
+                    )
+                }
+                is SmsDispatchResult.InvalidInput -> {
+                    failedCount++
+                    items += AutoReminderDispatchItem(
+                        customerId = customer.id,
+                        customerName = customer.name,
+                        phone = normalizedPhone,
+                        amountDue = customer.balance,
+                        messageBody = body,
+                        status = AutoReminderItemStatus.FAILED,
+                        detail = dispatch.reason,
+                    )
+                }
+                SmsDispatchResult.NoTelephonySupport -> {
+                    failedCount++
+                    items += AutoReminderDispatchItem(
+                        customerId = customer.id,
+                        customerName = customer.name,
+                        phone = normalizedPhone,
+                        amountDue = customer.balance,
+                        messageBody = body,
+                        status = AutoReminderItemStatus.FAILED,
+                        detail = "الجهاز لا يدعم خدمة الإرسال الخلوي المباشر",
+                    )
+                }
+            }
+        }
+
+        return AutoReminderDispatchReport(
+            evaluatedDueCustomersCount = dueCustomers.size,
+            sentCount = sentCount,
+            failedCount = failedCount,
+            skippedNoPhoneCount = skippedNoPhoneCount,
+            skippedCooldownCount = skippedCooldownCount,
+            permissionDenied = false,
+            items = items,
+        )
     }
 
     internal fun createSentPendingIntent(

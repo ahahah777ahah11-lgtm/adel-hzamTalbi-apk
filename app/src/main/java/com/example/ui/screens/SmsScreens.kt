@@ -298,6 +298,33 @@ fun SmsCenterScreen(
                                     Text("إلغاء تحديد الكل")
                                 }
                             }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Button(
+                                onClick = {
+                                    val autoAction = {
+                                        viewModel.sendAutomaticDueDebtReminders(
+                                            context = context,
+                                            templateBody = customTemplateBody.takeIf { it.isNotBlank() },
+                                            onNeedPermission = {
+                                                smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                                            },
+                                        )
+                                    }
+                                    if (hasSmsPermission) {
+                                        autoAction()
+                                    } else {
+                                        pendingDirectAction = autoAction
+                                        smsPermissionLauncher.launch(Manifest.permission.SEND_SMS)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("sms_auto_due_reminders_button"),
+                            ) {
+                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("إرسال تذكير تلقائي للديون المستحقة الآن")
+                            }
                         }
                     }
 

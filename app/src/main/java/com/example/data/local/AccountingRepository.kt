@@ -257,6 +257,7 @@ class AccountingRepository(private val database: SmartDebtDatabase) {
         sourceApp: String? = null,
         allowOverpayment: Boolean = false,
         duplicateWindowMinutes: Int = 5,
+        dueDate: Long? = null,
     ): AccountingResult<Long> {
         if (amount.isNaN() || amount.isInfinite() || amount <= 0.0) {
             return AccountingResult.Error("المبلغ غير صالح: يجب أن يكون أكبر من الصفر.")
@@ -315,6 +316,7 @@ class AccountingRepository(private val database: SmartDebtDatabase) {
                         customerId = customerId,
                         amount = amount,
                         description = cleanDesc,
+                        dueDate = dueDate,
                         isOpeningBalance = type == TransactionType.OPENING_BALANCE,
                         linkedTransactionId = insertedId,
                         referenceNumber = cleanRef,
@@ -687,5 +689,89 @@ class AccountingRepository(private val database: SmartDebtDatabase) {
 
     suspend fun deleteSmsTemplate(id: Long) {
         smsTemplateDao.deleteById(id)
+    }
+
+    fun observeAllCustomers(): Flow<List<CustomerEntity>> =
+        customerDao.observeAllCustomers()
+
+    fun observeDebtsForCustomer(customerId: Long): Flow<List<DebtsEntity>> =
+        debtsDao.observeDebtsForCustomer(customerId)
+
+    suspend fun updateDebtRecord(
+        debtId: Long,
+        amount: Double,
+        description: String,
+        dueDate: Long? = null,
+    ): AccountingResult<Unit> {
+        if (amount.isNaN() || amount.isInfinite() || amount <= 0.0) {
+            return AccountingResult.Error("مبلغ الدين غير صالح.")
+        }
+        val existing = debtsDao.getDebtById(debtId)
+            ?: return AccountingResult.Error("سجل الدين غير موجود.")
+        val cleanDesc = description.trim().ifBlank { existing.description }
+        val updated = existing.copy(
+            amount = amount,
+            description = cleanDesc,
+            dueDate = dueDate,
+        )
+        database.withTransaction {
+            debtsDao.updateDebt(updated)
+            auditLogDao.insert(
+                AuditLogEntity(
+                    actionType = "UPDATE_DEBT",
+                    entityType = "DEBT",
+                    entityId = debtId,
+                    summary = "تعديل سجل دين رقم $debtId بقيمة ${FormatUtils.formatAmount(amount)}",
+                    details = cleanDesc,
+                    createdAt = System.currentTimeMillis(),
+                )
+            )
+        }
+        return AccountingResult.Success(Unit, "تم تحديث سجل الدين")
+    }
+
+    suspend fun deleteDebtRecord(debtId: Long): AccountingResult<Unit> {
+        val existing = debtsDao.getDebtById(debtId)
+            ?: return AccountingResult.Error("سجل الدين غير موجود.")
+        database.withTransaction {
+            debtsDao.deleteDebt(existing)
+            auditLogDao.insert(
+                AuditLogEntity(
+                    actionType = "DELETE_DEBT",
+                    entityType = "DEBT",
+                    entityId = debtId,
+                    summary = "حذف سجل دين رقم $debtId",
+                    details = existing.description,
+                    createdAt = System.currentTimeMillis(),
+                )
+            )
+        }
+        return AccountingResult.Success(Unit, "تم حذف سجل الدين")
+    }
+
+    suspend fun deleteCustomerSafely(customerId: Long): AccountingResult<Unit> {
+        val existing = customerDao.getCustomerById(customerId)
+            ?: return AccountingResult.Error("العميل غير موجود.")
+        val linkedTx = transactionDao.getAllTransactionsOnce().any { it.customerId == customerId }
+        val linkedDebts = debtsDao.getAllDebtsOnce().any { it.customerId == customerId }
+        val linkedPayments = paymentsDao.getAllPaymentsOnce().any { it.customerId == customerId }
+        if (linkedTx || linkedDebts || linkedPayments) {
+            return AccountingResult.Error(
+                "لا يمكن حذف عميل مرتبط بعمليات مالية لحماية السجل المحاسبي؛ يمكنك أرشفة العميل بدلاً من الحذف."
+            )
+        }
+        database.withTransaction {
+            customerDao.delete(existing)
+            auditLogDao.insert(
+                AuditLogEntity(
+                    actionType = "DELETE_CUSTOMER",
+                    entityType = "CUSTOMER",
+                    entityId = customerId,
+                    summary = "حذف العميل: ${existing.name}",
+                    createdAt = System.currentTimeMillis(),
+                )
+            )
+        }
+        return AccountingResult.Success(Unit, "تم حذف العميل")
     }
 }

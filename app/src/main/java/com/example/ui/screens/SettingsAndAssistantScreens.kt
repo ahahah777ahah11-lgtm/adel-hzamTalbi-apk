@@ -143,6 +143,19 @@ fun SettingsScreen(
         }
     }
 
+    val storageFileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val persisted = AppPermissionsManager.takePersistableReadPermission(context, uri)
+            permissionsRefreshTick++
+            viewModel.emitFeedback(
+                if (persisted) "تم منح صلاحية الوصول الدائم للملف المحدد في التخزين"
+                else "تم فتح الملف المحدد بنجاح"
+            )
+        }
+    }
+
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -762,6 +775,17 @@ fun SettingsScreen(
                     Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("منح وصول لمجلدات ذاكرة الهاتف (التنزيلات / المستندات)")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { storageFileLauncher.launch(arrayOf("*/*")) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("grant_storage_file_button"),
+                ) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("منح وصول لملفات التخزين عبر مستكشف الملفات (SAF)")
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(

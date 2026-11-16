@@ -1,6 +1,7 @@
 package com.example.data.local
 
 import androidx.room.Dao
+import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
@@ -98,6 +99,9 @@ interface CustomerDao {
     suspend fun getCustomerWithBalanceOnce(customerId: Long): CustomerWithBalance?
 
     @Query("SELECT * FROM customers ORDER BY name ASC")
+    fun observeAllCustomers(): Flow<List<CustomerEntity>>
+
+    @Query("SELECT * FROM customers ORDER BY name ASC")
     suspend fun getAllCustomersOnce(): List<CustomerEntity>
 
     @Query("SELECT * FROM customers WHERE id = :id")
@@ -113,7 +117,13 @@ interface CustomerDao {
     suspend fun insert(customer: CustomerEntity): Long
 
     @Update
-    suspend fun update(customer: CustomerEntity)
+    suspend fun update(customer: CustomerEntity): Int
+
+    @Delete
+    suspend fun delete(customer: CustomerEntity): Int
+
+    @Query("DELETE FROM customers WHERE id = :customerId")
+    suspend fun deleteById(customerId: Long): Int
 
     @Transaction
     @Query("SELECT * FROM customers ORDER BY name ASC")
@@ -396,7 +406,13 @@ interface ClientDao {
     suspend fun insertClient(client: Clients): Long
 
     @Update
-    suspend fun updateClient(client: Clients)
+    suspend fun updateClient(client: Clients): Int
+
+    @Delete
+    suspend fun deleteClient(client: Clients): Int
+
+    @Query("DELETE FROM customers WHERE id = :clientId")
+    suspend fun deleteClientById(clientId: Long): Int
 }
 
 @Dao
@@ -415,6 +431,15 @@ interface DebtDao {
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertDebtOrPayment(entry: Debt): Long
+
+    @Update
+    suspend fun updateDebtOrPayment(entry: Debt): Int
+
+    @Delete
+    suspend fun deleteDebtOrPayment(entry: Debt): Int
+
+    @Query("DELETE FROM transactions WHERE id = :entryId")
+    suspend fun deleteDebtOrPaymentById(entryId: Long): Int
 }
 
 @Dao
@@ -425,6 +450,9 @@ interface DebtsDao {
     @Query("SELECT * FROM debts WHERE customer_id = :customerId AND is_reversed = 0 ORDER BY created_at DESC, id DESC")
     fun observeDebtsForCustomer(customerId: Long): Flow<List<DebtsEntity>>
 
+    @Query("SELECT * FROM debts WHERE id = :debtId LIMIT 1")
+    suspend fun getDebtById(debtId: Long): DebtsEntity?
+
     @Query("SELECT * FROM debts ORDER BY created_at ASC, id ASC")
     suspend fun getAllDebtsOnce(): List<DebtsEntity>
 
@@ -433,6 +461,15 @@ interface DebtsDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertDebt(debt: DebtsEntity): Long
+
+    @Update
+    suspend fun updateDebt(debt: DebtsEntity): Int
+
+    @Delete
+    suspend fun deleteDebt(debt: DebtsEntity): Int
+
+    @Query("DELETE FROM debts WHERE id = :debtId")
+    suspend fun deleteDebtById(debtId: Long): Int
 
     @Query("UPDATE debts SET is_reversed = 1 WHERE linked_transaction_id = :transactionId AND is_reversed = 0")
     suspend fun markReversedByTransactionId(transactionId: Long): Int
@@ -455,8 +492,17 @@ interface PaymentsDao {
     @Query("SELECT COALESCE(SUM(amount), 0.0) FROM payments WHERE customer_id = :customerId AND is_reversed = 0")
     suspend fun getTotalPaymentsForCustomer(customerId: Long): Double
 
+    @Query("SELECT * FROM payments WHERE id = :paymentId LIMIT 1")
+    suspend fun getPaymentById(paymentId: Long): PaymentsEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertPayment(payment: PaymentsEntity): Long
+
+    @Update
+    suspend fun updatePayment(payment: PaymentsEntity): Int
+
+    @Delete
+    suspend fun deletePayment(payment: PaymentsEntity): Int
 
     @Query("UPDATE payments SET is_reversed = 1 WHERE linked_transaction_id = :transactionId AND is_reversed = 0")
     suspend fun markReversedByTransactionId(transactionId: Long): Int

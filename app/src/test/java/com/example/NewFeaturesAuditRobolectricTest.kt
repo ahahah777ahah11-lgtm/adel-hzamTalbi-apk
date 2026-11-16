@@ -8,17 +8,23 @@ import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextReplacement
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.Customers
 import com.example.data.local.Debts
 import com.example.data.sms.DirectSmsSender
+import com.example.data.sms.SmsDispatchResult
+import com.example.data.sms.SmsGateway
 import com.example.ui.screens.CustomersScreen
 import com.example.ui.screens.ImportDataScreen
 import com.example.ui.screens.SettingsScreen
@@ -51,6 +57,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -338,35 +345,72 @@ class NewFeaturesAuditRobolectricTest {
     @Test
     fun `import screen displays SAF storage folder authorization trigger cleanly`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
-        val vm = SmartDebtViewModel.Factory(app).create(SmartDebtViewModel::class.java)
+        val db = newInMemoryDb(app)
+        val repo = AccountingRepository(db)
+        val settingsStore = SettingsDataStore(app)
+        val backupMgr = BackupManager(db, settingsStore)
+        val inspector = ExternalDbInspector(db, backupMgr)
+        val store = ViewModelStore()
+        val vm = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                    SmartDebtViewModel(app, repo, settingsStore, backupMgr, ExportManager(), inspector) as T
+            },
+        )[SmartDebtViewModel::class.java]
 
-        composeRule.setContent {
-            SmartDebtTheme {
-                ImportDataScreen(viewModel = vm, onBack = {})
+        try {
+            composeRule.setContent {
+                SmartDebtTheme {
+                    ImportDataScreen(viewModel = vm, onBack = {})
+                }
             }
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("authorize_storage_folder_import_button")
+                .performScrollTo()
+                .assertIsDisplayed()
+        } finally {
+            store.clear()
+            db.close()
         }
-        composeRule.onNodeWithTag("authorize_storage_folder_import_button")
-            .performScrollTo()
-            .assertIsDisplayed()
-
-        SmartDebtDatabase.getInstance(app).close()
     }
 
     @Test
     fun `settings screen displays SAF storage folder grant trigger cleanly`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
-        val vm = SmartDebtViewModel.Factory(app).create(SmartDebtViewModel::class.java)
+        val db = newInMemoryDb(app)
+        val repo = AccountingRepository(db)
+        val settingsStore = SettingsDataStore(app)
+        val backupMgr = BackupManager(db, settingsStore)
+        val inspector = ExternalDbInspector(db, backupMgr)
+        val store = ViewModelStore()
+        val vm = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                    SmartDebtViewModel(app, repo, settingsStore, backupMgr, ExportManager(), inspector) as T
+            },
+        )[SmartDebtViewModel::class.java]
 
-        composeRule.setContent {
-            SmartDebtTheme {
-                SettingsScreen(viewModel = vm, onBack = {})
+        try {
+            composeRule.setContent {
+                SmartDebtTheme {
+                    SettingsScreen(viewModel = vm, onBack = {})
+                }
             }
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("grant_storage_folder_button")
+                .performScrollTo()
+                .assertIsDisplayed()
+            composeRule.onNodeWithTag("grant_storage_file_button")
+                .performScrollTo()
+                .assertIsDisplayed()
+        } finally {
+            store.clear()
+            db.close()
         }
-        composeRule.onNodeWithTag("grant_storage_folder_button")
-            .performScrollTo()
-            .assertIsDisplayed()
-
-        SmartDebtDatabase.getInstance(app).close()
     }
 
     @Test
@@ -377,14 +421,28 @@ class NewFeaturesAuditRobolectricTest {
             val custId = db.customerDao().insert(
                 Customers(name = "مؤسسة الأمل", phone = "771002003", accountNumber = "ACC-REL-1")
             )
-            db.debtsDao().insertDebt(Debts(customerId = custId, amount = 3200.0, description = "بضاعة آجل"))
-            db.debtsDao().insertDebt(Debts(customerId = custId, amount = 1800.0, description = "فاتورة ثانية"))
+            val debt1Id = db.debtsDao().insertDebt(Debts(customerId = custId, amount = 3200.0, description = "بضاعة آجل"))
+            val debt2Id = db.debtsDao().insertDebt(Debts(customerId = custId, amount = 1800.0, description = "فاتورة ثانية"))
+
+            // Update and delete CRUD verification on DebtsDao and CustomerDao
+            val debt1 = db.debtsDao().getDebtById(debt1Id)!!
+            assertEquals(1, db.debtsDao().updateDebt(debt1.copy(amount = 3500.0, description = "بضاعة آجل معدلة")))
+            assertEquals(1, db.debtsDao().deleteDebtById(debt2Id))
+
+            val customer = db.customerDao().getCustomerById(custId)!!
+            assertEquals(1, db.customerDao().update(customer.copy(notes = "عميل موثق")))
 
             val rel = db.customerDao().getCustomerWithDebts(custId)
             assertNotNull(rel)
             assertEquals("مؤسسة الأمل", rel!!.customer.name)
-            assertEquals(2, rel.debts.size)
-            assertEquals(5000.0, rel.debts.sumOf { it.amount }, 0.01)
+            assertEquals("عميل موثق", rel.customer.notes)
+            assertEquals(1, rel.debts.size)
+            assertEquals(3500.0, rel.debts.sumOf { it.amount }, 0.01)
+
+            // Verify CustomerDao delete on unlinked customer
+            val tempCustId = db.customerDao().insert(Customers(name = "عميل مؤقت", phone = "770000999"))
+            assertEquals(1, db.customerDao().deleteById(tempCustId))
+            assertNull(db.customerDao().getCustomerById(tempCustId))
 
             val pkgInfo = context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
             val declared = pkgInfo.requestedPermissions?.toSet().orEmpty()
@@ -393,6 +451,24 @@ class NewFeaturesAuditRobolectricTest {
             assertTrue(AppPermissionsManager.allRuntimePermissions().contains(Manifest.permission.READ_SMS))
             assertTrue(AppPermissionsManager.getCapabilityStatuses(context, true).any { it.kind == AppCapabilityKind.READ_SMS })
             assertTrue(DirectSmsSender.readRecentInboxMessages(context).isEmpty())
+
+            // Verify sendSmsToCustomer checks SEND_SMS permission and dispatches when granted
+            val deniedRes = DirectSmsSender.sendSmsToCustomer(context, "771002003", "تذكير برصيد مستحق")
+            assertEquals(SmsDispatchResult.PermissionDenied, deniedRes)
+
+            Shadows.shadowOf(context as Application).grantPermissions(Manifest.permission.SEND_SMS)
+            val sentRes = DirectSmsSender.sendSmsToCustomer(
+                context = context,
+                customerPhone = "771-002-003",
+                message = "مرحباً بكم، الرصيد المستحق 3500 ر.ي",
+                gateway = object : SmsGateway {
+                    override fun sendSms(context: Context, destination: String, messageBody: String, logId: Long): Int {
+                        assertEquals("771002003", destination)
+                        return 1
+                    }
+                },
+            )
+            assertTrue(sentRes is SmsDispatchResult.Dispatched)
         } finally {
             db.close()
         }
@@ -406,26 +482,40 @@ class NewFeaturesAuditRobolectricTest {
         val settingsStore = SettingsDataStore(app)
         val backupMgr = BackupManager(db, settingsStore)
         val inspector = ExternalDbInspector(db, backupMgr)
-        val vm = SmartDebtViewModel(app, repo, settingsStore, backupMgr, ExportManager(), inspector)
+        val store = ViewModelStore()
+        val vm = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                    SmartDebtViewModel(app, repo, settingsStore, backupMgr, ExportManager(), inspector) as T
+            },
+        )[SmartDebtViewModel::class.java]
 
-        composeRule.setContent {
-            SmartDebtTheme {
-                CustomersScreen(viewModel = vm, onNavigate = {})
+        try {
+            composeRule.setContent {
+                SmartDebtTheme {
+                    CustomersScreen(viewModel = vm, onNavigate = {})
+                }
             }
+            composeRule.waitForIdle()
+
+            composeRule.onNodeWithTag("quick_add_customer_button").assertIsDisplayed().performClick()
+            composeRule.onNodeWithTag("quick_customer_name_input").performTextReplacement("فهد اليماني")
+            composeRule.onNodeWithTag("quick_customer_phone_input").performTextReplacement("778899001")
+            composeRule.onNodeWithTag("quick_customer_opening_input").performTextReplacement("2400")
+            composeRule.onNodeWithTag("quick_customer_save_button").performClick()
+
+            composeRule.waitUntil(timeoutMillis = 5000) {
+                composeRule.onAllNodesWithTag("quick_customer_save_button").fetchSemanticsNodes().isEmpty() &&
+                    composeRule.onAllNodesWithTag("customers_list").fetchSemanticsNodes().isNotEmpty() &&
+                    composeRule.onAllNodesWithText("فهد اليماني").fetchSemanticsNodes().isNotEmpty()
+            }
+            composeRule.waitForIdle()
+            composeRule.onNodeWithText("فهد اليماني").assertIsDisplayed()
+        } finally {
+            store.clear()
+            db.close()
         }
-
-        composeRule.onNodeWithTag("quick_add_customer_button").assertIsDisplayed().performClick()
-        composeRule.onNodeWithTag("quick_customer_name_input").performTextInput("فهد اليماني")
-        composeRule.onNodeWithTag("quick_customer_phone_input").performTextInput("778899001")
-        composeRule.onNodeWithTag("quick_customer_opening_input").performTextInput("2400")
-        composeRule.onNodeWithTag("quick_customer_save_button").performClick()
-
-        composeRule.waitUntil(timeoutMillis = 5000) {
-            composeRule.onAllNodesWithText("فهد اليماني").fetchSemanticsNodes().isNotEmpty()
-        }
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("فهد اليماني").assertIsDisplayed()
-
-        db.close()
     }
 }

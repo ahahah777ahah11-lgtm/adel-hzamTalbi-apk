@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -37,6 +38,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Info
@@ -57,6 +59,7 @@ import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -441,18 +444,20 @@ fun CollectionDonutChart(
     totalDebts: Double,
     totalPayments: Double,
     modifier: Modifier = Modifier,
+    chartSize: androidx.compose.ui.unit.Dp = 100.dp,
+    strokeWidth: androidx.compose.ui.unit.Dp = 16.dp,
 ) {
     val financial = LocalFinancialColors.current
-    val collectedRatio = if (totalDebts > 0.0) (totalPayments / totalDebts).toFloat().coerceIn(0f, 1f) else 1f
+    val collectedRatio = if (totalDebts > 0.0) (totalPayments / totalDebts).toFloat().coerceIn(0f, 1f) else 0f
     val percentText = "${"%.0f".format(collectedRatio * 100)}%"
 
-    Box(modifier = modifier.size(110.dp), contentAlignment = Alignment.Center) {
-        Canvas(modifier = Modifier.size(100.dp)) {
-            val stroke = 16.dp.toPx()
+    Box(modifier = modifier.size(chartSize + 10.dp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.size(chartSize)) {
+            val stroke = strokeWidth.toPx()
             val arcSize = Size(size.width - stroke, size.height - stroke)
             val topLeft = Offset(stroke / 2, stroke / 2)
             drawArc(
-                color = financial.danger.copy(alpha = 0.22f),
+                color = financial.danger.copy(alpha = 0.24f),
                 startAngle = 0f,
                 sweepAngle = 360f,
                 useCenter = false,
@@ -460,20 +465,22 @@ fun CollectionDonutChart(
                 size = arcSize,
                 style = Stroke(width = stroke, cap = StrokeCap.Round),
             )
-            drawArc(
-                color = financial.success,
-                startAngle = -90f,
-                sweepAngle = 360f * collectedRatio,
-                useCenter = false,
-                topLeft = topLeft,
-                size = arcSize,
-                style = Stroke(width = stroke, cap = StrokeCap.Round),
-            )
+            if (collectedRatio > 0f) {
+                drawArc(
+                    color = financial.success,
+                    startAngle = -90f,
+                    sweepAngle = 360f * collectedRatio,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = stroke, cap = StrokeCap.Round),
+                )
+            }
         }
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
                 text = percentText,
-                style = MaterialTheme.typography.titleMedium,
+                style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
             )
             Text(
@@ -481,6 +488,167 @@ fun CollectionDonutChart(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+@Composable
+fun CustomersPortfolioSummaryCard(
+    totalDebts: Double,
+    totalCollected: Double,
+    currency: String,
+    customersCount: Int,
+    onExportCsv: () -> Unit,
+    onImportCsv: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val financial = LocalFinancialColors.current
+    val maxVal = maxOf(totalDebts, totalCollected, 1.0)
+    val collectedRate = if (totalDebts > 0.0) ((totalCollected / totalDebts) * 100.0).coerceIn(0.0, 100.0) else 0.0
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("customers_summary_card"),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "ملخص الديون مقابل التحصيل ($customersCount عميل)",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                StatusBadge(
+                    text = "${"%.0f".format(collectedRate)}% محصل",
+                    color = if (collectedRate >= 50.0) financial.success else financial.orange,
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CollectionDonutChart(
+                    totalDebts = totalDebts,
+                    totalPayments = totalCollected,
+                    chartSize = 58.dp,
+                    strokeWidth = 9.dp,
+                )
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    val debtRatio = (totalDebts / maxVal).toFloat().coerceIn(0f, 1f)
+                    val paidRatio = (totalCollected / maxVal).toFloat().coerceIn(0f, 1f)
+
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text("إجمالي الديون", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                FormatUtils.formatAmount(totalDebts, currency),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = financial.danger,
+                                modifier = Modifier.testTag("summary_total_debts_text"),
+                            )
+                        }
+                        Canvas(modifier = Modifier.fillMaxWidth().height(8.dp)) {
+                            drawRoundRect(
+                                color = financial.danger.copy(alpha = 0.14f),
+                                size = size,
+                                cornerRadius = CornerRadius(8f, 8f),
+                            )
+                            if (debtRatio > 0f) {
+                                drawRoundRect(
+                                    brush = Brush.horizontalGradient(listOf(financial.danger, financial.danger.copy(alpha = 0.78f))),
+                                    size = Size(size.width * debtRatio, size.height),
+                                    cornerRadius = CornerRadius(8f, 8f),
+                                )
+                            }
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text("المدفوعات المحصلة", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                FormatUtils.formatAmount(totalCollected, currency),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = financial.success,
+                                modifier = Modifier.testTag("summary_total_collected_text"),
+                            )
+                        }
+                        Canvas(modifier = Modifier.fillMaxWidth().height(8.dp)) {
+                            drawRoundRect(
+                                color = financial.success.copy(alpha = 0.14f),
+                                size = size,
+                                cornerRadius = CornerRadius(8f, 8f),
+                            )
+                            if (paidRatio > 0f) {
+                                drawRoundRect(
+                                    brush = Brush.horizontalGradient(listOf(financial.success, financial.success.copy(alpha = 0.78f))),
+                                    size = Size(size.width * paidRatio, size.height),
+                                    cornerRadius = CornerRadius(8f, 8f),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onExportCsv,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("customers_export_csv_button"),
+                ) {
+                    Icon(Icons.Default.FileDownload, contentDescription = "تصدير قاعدة البيانات CSV", modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("تصدير CSV", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
+                FilledTonalButton(
+                    onClick = onImportCsv,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("customers_import_csv_button"),
+                ) {
+                    Icon(Icons.Default.FileUpload, contentDescription = "استيراد بيانات CSV", modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("استيراد CSV", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
+            }
         }
     }
 }
